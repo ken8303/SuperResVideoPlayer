@@ -40,6 +40,20 @@ final class MPVPlayer {
         let serial: UInt64
     }
 
+    /// One selectable stream inside the container — an audio track (language,
+    /// commentary) or an embedded subtitle track. Mirrors an entry of mpv's
+    /// `track-list`. Only plain value types so it can cross to the main queue.
+    struct Track: Identifiable, Equatable {
+        enum Kind: String { case video, audio, sub, unknown }
+        /// mpv's per-type track id (1-based); the value passed to `aid`/`sid`.
+        let id: Int64
+        let kind: Kind
+        let title: String?
+        let lang: String?
+        let isDefault: Bool
+        let isSelected: Bool
+    }
+
     // MARK: Callbacks (all invoked on the main queue)
 
     var onTimeChanged: ((Double) -> Void)?
@@ -50,6 +64,9 @@ final class MPVPlayer {
     /// initiates itself, e.g. during a buffering stall) — lets the UI's
     /// play/pause button track reality instead of inferring it.
     var onPauseChanged: ((Bool) -> Void)?
+    /// Fired once a file's streams are known (and whenever they change) with
+    /// the full track list, so the UI can offer audio/subtitle track pickers.
+    var onTracksChanged: (([Track]) -> Void)?
 
     // MARK: State
 
@@ -111,6 +128,19 @@ final class MPVPlayer {
         mpv_set_option_string(handle, "terminal", "no")
         mpv_set_option_string(handle, "msg-level", "all=warn")
 
+        // Recent macOS moved its bundled CJK font (PingFang) into a protected
+        // PrivateFrameworks path that libass/FreeType can't open — so
+        // Chinese/Japanese/Korean subtitles fall back to nothing and render
+        // as boxes with the default sans-serif. Point libass at a system CJK
+        // font that lives in a readable location (Songti, in
+        // /System/Library/Fonts/Supplemental) so those glyphs render.
+        // (For guaranteed coverage across all of C/J/K in the shipped app,
+        // bundle a font like Noto Sans CJK and name it here instead.)
+        mpv_set_option_string(handle, "sub-font", "Songti SC")
+        // Detect the encoding of external non-UTF-8 subtitle files (embedded
+        // subs are already UTF-8; harmless there).
+        mpv_set_option_string(handle, "sub-codepage", "auto")
+
         guard mpv_initialize(handle) >= 0 else {
             print("SuperResVideoPlayer: mpv_initialize failed — playback unavailable.")
             mpv_terminate_destroy(handle)
@@ -122,6 +152,9 @@ final class MPVPlayer {
         mpv_observe_property(handle, 0, "duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "eof-reached", MPV_FORMAT_FLAG)
         mpv_observe_property(handle, 0, "pause", MPV_FORMAT_FLAG)
+        // Format NONE = "notify me it changed" without marshalling a value;
+        // we re-read the whole list when it fires (see readTracks()).
+        mpv_observe_property(handle, 0, "track-list", MPV_FORMAT_NONE)
 
         createRenderContext()
         startEventThread()
@@ -249,9 +282,17 @@ final class MPVPlayer {
                     let paused = raw.assumingMemoryBound(to: Int32.self).pointee != 0
                     DispatchQueue.main.async { [weak self] in self?.onPauseChanged?(paused) }
                 }
+            case "track-list":
+                publishTracks()
             default:
                 break
             }
+
+        case MPV_EVENT_FILE_LOADED:
+            // Streams are fully known here — reliable point to populate the
+            // audio/subtitle pickers even if the track-list observer already
+            // fired with partial info.
+            publishTracks()
 
         case MPV_EVENT_END_FILE:
             guard let data = event.pointee.data else { return }
@@ -300,6 +341,65 @@ final class MPVPlayer {
         guard let handle else { return }
         var flag: Int32 = muted ? 1 : 0
         mpv_set_property(handle, "mute", MPV_FORMAT_FLAG, &flag)
+    }
+
+    // MARK: Track selection
+
+    /// Switch the active audio track by its mpv id (from `Track.id`).
+    func setAudioTrack(_ id: Int64) {
+        guard let handle else { return }
+        mpv_set_property_string(handle, "aid", String(id))
+    }
+
+    /// Switch the active embedded subtitle track by id, or pass `nil` to turn
+    /// embedded subtitles off. (These are the container's own subtitles,
+    /// rendered by mpv into the frame — separate from the app's AI subtitles.)
+    func setSubtitleTrack(_ id: Int64?) {
+        guard let handle else { return }
+        mpv_set_property_string(handle, "sid", id.map(String.init) ?? "no")
+    }
+
+    /// Reads mpv's current `track-list` and delivers it on the main queue.
+    /// Safe to call from the event thread — the mpv client API is thread-safe.
+    private func publishTracks() {
+        let tracks = readTracks()
+        DispatchQueue.main.async { [weak self] in self?.onTracksChanged?(tracks) }
+    }
+
+    private func readTracks() -> [Track] {
+        guard let handle else { return [] }
+        var count: Int64 = 0
+        guard mpv_get_property(handle, "track-list/count", MPV_FORMAT_INT64, &count) >= 0,
+              count > 0 else { return [] }
+
+        var tracks: [Track] = []
+        for index in 0..<count {
+            var id: Int64 = 0
+            mpv_get_property(handle, "track-list/\(index)/id", MPV_FORMAT_INT64, &id)
+            let type = getPropertyString("track-list/\(index)/type") ?? "unknown"
+            let title = getPropertyString("track-list/\(index)/title")
+            let lang = getPropertyString("track-list/\(index)/lang")
+            var isDefault: Int32 = 0
+            mpv_get_property(handle, "track-list/\(index)/default", MPV_FORMAT_FLAG, &isDefault)
+            var isSelected: Int32 = 0
+            mpv_get_property(handle, "track-list/\(index)/selected", MPV_FORMAT_FLAG, &isSelected)
+            tracks.append(Track(id: id,
+                                kind: Track.Kind(rawValue: type) ?? .unknown,
+                                title: title,
+                                lang: lang,
+                                isDefault: isDefault != 0,
+                                isSelected: isSelected != 0))
+        }
+        return tracks
+    }
+
+    /// mpv returns a heap-allocated C string that must be freed with mpv_free.
+    /// Empty strings become nil so the UI can fall back to a generic label.
+    private func getPropertyString(_ name: String) -> String? {
+        guard let handle, let cString = mpv_get_property_string(handle, name) else { return nil }
+        defer { mpv_free(cString) }
+        let value = String(cString: cString)
+        return value.isEmpty ? nil : value
     }
 
     /// Current playback position in seconds. Thread-safe; used by the

@@ -53,6 +53,11 @@ final class VideoExporter: @unchecked Sendable {
         /// If set, stop after this many seconds of source video — used by
         /// the "test export" to compare engines without a full render.
         var durationLimitSeconds: Double?
+        /// Zero-based index among the source's audio tracks (container
+        /// order, matching the app's Audio picker). Callers must pass 0 when
+        /// the source has already been remuxed/transcoded down to a single
+        /// audio track.
+        var audioTrackIndex: Int = 0
     }
 
     private let workQueue = DispatchQueue(label: "SuperResVideoPlayer.VideoExport", qos: .userInitiated)
@@ -104,7 +109,13 @@ final class VideoExporter: @unchecked Sendable {
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw VideoExportError.unreadableSource("No video track found.")
         }
-        let audioTrack = try await asset.loadTracks(withMediaType: .audio).first
+        // Honor the user's Audio picker selection; clamp defensively in case
+        // AVFoundation exposes fewer tracks than mpv did (it can't read some
+        // codecs), falling back to the first rather than exporting silence.
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        let audioTrack: AVAssetTrack? = audioTracks.isEmpty
+            ? nil
+            : audioTracks[min(max(0, configuration.audioTrackIndex), audioTracks.count - 1)]
         let duration = try await asset.load(.duration).seconds
         let nominalFPS = try await videoTrack.load(.nominalFrameRate)
 

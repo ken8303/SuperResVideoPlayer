@@ -18,11 +18,29 @@ enum EnhancerEngine: String, CaseIterable, Identifiable {
 /// natively — no conversion step.
 final class PlayerViewModel: ObservableObject {
 
+    /// Refresh channel for the settings menus (video context menu + "Video"
+    /// menu-bar menu). Menus must NOT observe the view model itself:
+    /// `currentTime` updates several times a second and `pipelineStatus`
+    /// every second, and rebuilding an open NSMenu that often makes it
+    /// flash and impossible to click. This object fires only when a value
+    /// the menus actually display changes.
+    final class MenuState: ObservableObject {
+        fileprivate func changed() { objectWillChange.send() }
+    }
+    let menuState = MenuState()
+
     // MARK: Published UI state
 
-    @Published var isPlaying = false
+    // Drives the Playback menu's Play/Pause label.
+    @Published var isPlaying = false {
+        didSet { if oldValue != isPlaying { menuState.changed() } }
+    }
     @Published var currentTime: Double = 0
-    @Published var duration: Double = 0
+    @Published var duration: Double = 0 {
+        // Menus only care whether a video is loaded at all (item enabling);
+        // ordinary duration refinements shouldn't rebuild an open menu.
+        didSet { if (oldValue == 0) != (duration == 0) { menuState.changed() } }
+    }
     @Published var videoTitle: String = "No video loaded"
     @Published var isScrubbing = false
 
@@ -35,12 +53,36 @@ final class PlayerViewModel: ObservableObject {
         }
     }
     @Published var isMuted = false {
-        didSet { mpv.setMuted(isMuted) }
+        // Drives the Playback menu's Mute/Unmute label.
+        didSet {
+            mpv.setMuted(isMuted)
+            if oldValue != isMuted { menuState.changed() }
+        }
     }
 
     /// Set when a file fails to open/decode, so the UI can say why nothing
     /// is playing instead of silently showing a black view.
     @Published var playbackErrorMessage: String?
+
+    // MARK: Audio / subtitle track selection (the container's own streams)
+
+    /// Selectable audio tracks in the current file (languages, commentary).
+    @Published private(set) var audioTracks: [MPVPlayer.Track] = [] {
+        didSet { if oldValue != audioTracks { menuState.changed() } }
+    }
+    /// Embedded subtitle tracks in the current file — mpv renders these into
+    /// the frame, separate from the app's AI-generated subtitles.
+    @Published private(set) var subtitleTracks: [MPVPlayer.Track] = [] {
+        didSet { if oldValue != subtitleTracks { menuState.changed() } }
+    }
+    /// mpv id of the active audio track (0 = none selected yet).
+    @Published private(set) var currentAudioTrackID: Int64 = 0 {
+        didSet { if oldValue != currentAudioTrackID { menuState.changed() } }
+    }
+    /// mpv id of the active embedded subtitle track (0 = off).
+    @Published private(set) var currentSubtitleTrackID: Int64 = 0 {
+        didSet { if oldValue != currentSubtitleTrackID { menuState.changed() } }
+    }
 
     /// One-line description of whatever long-running background work is in
     /// flight (audio extraction, model downloads, transcription,
@@ -54,7 +96,10 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: Video export state
 
-    @Published var isExportingVideo = false
+    // Drives the enabled state of Open/Export items in the menus.
+    @Published var isExportingVideo = false {
+        didSet { if oldValue != isExportingVideo { menuState.changed() } }
+    }
     @Published var exportProgress: Double = 0
     private var videoExporter: VideoExporter?
 
@@ -68,10 +113,16 @@ final class PlayerViewModel: ObservableObject {
     /// These enhancement/quality settings persist across launches (see
     /// `Defaults` and `restoreSettings()`).
     @Published var imageEnhancementEnabled = false {
-        didSet { Defaults.set(imageEnhancementEnabled, .imageEnhancementEnabled) }
+        didSet {
+            Defaults.set(imageEnhancementEnabled, .imageEnhancementEnabled)
+            if oldValue != imageEnhancementEnabled { menuState.changed() }
+        }
     }
     @Published var enhancementEngine: EnhancerEngine = .classic {
-        didSet { Defaults.set(enhancementEngine.rawValue, .enhancementEngine) }
+        didSet {
+            Defaults.set(enhancementEngine.rawValue, .enhancementEngine)
+            if oldValue != enhancementEngine { menuState.changed() }
+        }
     }
     @Published var enhancementStrength: Double = 0.5 {
         didSet { Defaults.set(enhancementStrength, .enhancementStrength) }
@@ -79,19 +130,28 @@ final class PlayerViewModel: ObservableObject {
 
     /// Toggle for enabling/disabling MetalFX Super Resolution upscaling.
     @Published var superResolutionEnabled = true {
-        didSet { Defaults.set(superResolutionEnabled, .superResolutionEnabled) }
+        didSet {
+            Defaults.set(superResolutionEnabled, .superResolutionEnabled)
+            if oldValue != superResolutionEnabled { menuState.changed() }
+        }
     }
 
     /// Target upscale factor applied by MetalFX when Super Resolution is on.
     @Published var upscaleFactor: Double = 1.5 {
-        didSet { Defaults.set(upscaleFactor, .upscaleFactor) }
+        didSet {
+            Defaults.set(upscaleFactor, .upscaleFactor)
+            if oldValue != upscaleFactor { menuState.changed() }
+        }
     }
 
     /// AI Frame Interpolation smoothing multiplier: 1 = off, 2 = one
     /// synthesized in-between frame per real pair (native MetalFX), 3 = two
     /// synthesized frames per real pair (custom warp fallback).
     @Published var frameInterpolationMultiplier: Int = 1 {
-        didSet { Defaults.set(frameInterpolationMultiplier, .frameInterpolationMultiplier) }
+        didSet {
+            Defaults.set(frameInterpolationMultiplier, .frameInterpolationMultiplier)
+            if oldValue != frameInterpolationMultiplier { menuState.changed() }
+        }
     }
 
     /// Set by `Renderer` if MetalFX spatial scaling is unsupported on this GPU.
@@ -103,9 +163,16 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: AI Subtitle Generator state
 
-    @Published var subtitleCues: [SubtitleCue] = []
-    @Published var subtitlesEnabled = true
-    @Published var isGeneratingSubtitles = false
+    @Published var subtitleCues: [SubtitleCue] = [] {
+        // Menus only show whether cues exist (AI Subtitles enabled state).
+        didSet { if oldValue.isEmpty != subtitleCues.isEmpty { menuState.changed() } }
+    }
+    @Published var subtitlesEnabled = true {
+        didSet { if oldValue != subtitlesEnabled { menuState.changed() } }
+    }
+    @Published var isGeneratingSubtitles = false {
+        didSet { if oldValue != isGeneratingSubtitles { menuState.changed() } }
+    }
     @Published var subtitleGenerationProgress: Double = 0
     @Published var subtitleErrorMessage: String?
 
@@ -254,6 +321,15 @@ final class PlayerViewModel: ObservableObject {
             self.playbackErrorMessage = "Couldn't play this video: \(message)"
             self.isPlaying = false
         }
+        mpv.onTracksChanged = { [weak self] tracks in
+            guard let self else { return }
+            self.audioTracks = tracks.filter { $0.kind == .audio }
+            self.subtitleTracks = tracks.filter { $0.kind == .sub }
+            // Reflect whatever mpv auto-selected so the pickers open on the
+            // right row (a subtitle track may be auto-selected as default).
+            self.currentAudioTrackID = self.audioTracks.first(where: { $0.isSelected })?.id ?? 0
+            self.currentSubtitleTrackID = self.subtitleTracks.first(where: { $0.isSelected })?.id ?? 0
+        }
 
         // Let the subtitle generator surface its internal phases (model
         // download, transcription) in the status row.
@@ -354,6 +430,13 @@ final class PlayerViewModel: ObservableObject {
         playbackErrorMessage = nil
         statusMessage = nil // clear any status a superseded operation left behind
 
+        // Track lists belong to the previous file; repopulated when mpv
+        // reports the new file's streams (onTracksChanged).
+        audioTracks = []
+        subtitleTracks = []
+        currentAudioTrackID = 0
+        currentSubtitleTrackID = 0
+
         // A new video invalidates any subtitles (and in-flight
         // transcription) generated for the previous one.
         subtitleGenerator.cancel()
@@ -412,6 +495,29 @@ final class PlayerViewModel: ObservableObject {
         isMuted.toggle()
     }
 
+    // MARK: Track selection
+
+    /// Switch the active audio track (by mpv id from `audioTracks`).
+    func selectAudioTrack(_ id: Int64) {
+        mpv.setAudioTrack(id)
+        currentAudioTrackID = id
+    }
+
+    /// Zero-based position of the selected audio track among the file's
+    /// audio streams (container order — mpv lists them in that order, and
+    /// ffmpeg's `0:a:N` / AVFoundation's track array use the same order).
+    /// Used so subtitle generation and export operate on the *listened-to*
+    /// track, not blindly the first one.
+    var selectedAudioStreamIndex: Int {
+        audioTracks.firstIndex(where: { $0.id == currentAudioTrackID }) ?? 0
+    }
+
+    /// Switch the active embedded subtitle track, or pass 0 to turn them off.
+    func selectSubtitleTrack(_ id: Int64) {
+        mpv.setSubtitleTrack(id == 0 ? nil : id)
+        currentSubtitleTrackID = id
+    }
+
     // MARK: AI Subtitle Generator
 
     /// Transcribes the current video's audio in the background and
@@ -429,12 +535,15 @@ final class PlayerViewModel: ObservableObject {
 
         let locale = subtitleLanguage
         let totalDuration = duration
+        // Transcribe the track the user is actually listening to (Audio
+        // picker), not blindly the file's first audio stream.
+        let audioStreamIndex = selectedAudioStreamIndex
 
         Task { @MainActor in
             // Extraction (when needed) is roughly the first 15% of the
             // progress bar; transcription fills the rest.
             func extractAudio() async throws -> URL {
-                let audioURL = try await mediaImporter.extractAudio(from: url) { [weak self] progress in
+                let audioURL = try await mediaImporter.extractAudio(from: url, audioStreamIndex: audioStreamIndex) { [weak self] progress in
                     guard let self, self.subtitleGenerationID == myGeneration else { return }
                     self.subtitleGenerationProgress = progress * 0.15
                 }
@@ -546,14 +655,16 @@ final class PlayerViewModel: ObservableObject {
         exportProgress = 0
         playbackErrorMessage = nil
 
-        let configuration = VideoExporter.Configuration(
+        var configuration = VideoExporter.Configuration(
             superResolutionEnabled: superResolutionEnabled,
             upscaleFactor: upscaleFactor,
             frameInterpolationMultiplier: frameInterpolationMultiplier,
             imageEnhancementEnabled: imageEnhancementEnabled,
             enhancementEngine: enhancementEngine,
             enhancementStrength: enhancementStrength,
-            durationLimitSeconds: durationLimit
+            durationLimitSeconds: durationLimit,
+            // Export the audio track the user selected in the Audio picker.
+            audioTrackIndex: selectedAudioStreamIndex
         )
         let exporter = VideoExporter()
         videoExporter = exporter
@@ -593,10 +704,14 @@ final class PlayerViewModel: ObservableObject {
                 // (stream copy where possible, so this is usually fast).
                 if MediaImporter.needsAudioExtraction(source) {
                     self.statusMessage = "Repackaging video for export…"
-                    readableSource = try await importer.remuxVideoToMP4(from: source) { [weak self] progress in
+                    readableSource = try await importer.remuxVideoToMP4(
+                        from: source, audioStreamIndex: configuration.audioTrackIndex) { [weak self] progress in
                         guard let self, self.isExportingVideo else { return }
                         self.statusMessage = "Repackaging video for export… \(Int(progress * 100))%"
                     }
+                    // The remuxed file carries only the selected track, so
+                    // downstream stages must read its (sole) first track.
+                    configuration.audioTrackIndex = 0
                 }
 
                 do {
@@ -609,10 +724,13 @@ final class PlayerViewModel: ObservableObject {
                     guard case .unreadableSource = error, MediaImporter.isFFmpegAvailable else { throw error }
                     print("SuperResVideoPlayer: export reader failed (\(error.localizedDescription)); transcoding to a compatible format and retrying")
                     self.statusMessage = "Preparing source for export…"
-                    let compatible = try await importer.transcodeForExport(from: readableSource) { [weak self] progress in
+                    let compatible = try await importer.transcodeForExport(
+                        from: readableSource, audioStreamIndex: configuration.audioTrackIndex) { [weak self] progress in
                         guard let self, self.isExportingVideo else { return }
                         self.statusMessage = "Preparing source for export… \(Int(progress * 100))%"
                     }
+                    // Single audio track from here on (see remux above).
+                    configuration.audioTrackIndex = 0
                     let retryExporter = VideoExporter()
                     self.videoExporter = retryExporter
                     try await runExport(from: compatible, using: retryExporter)
@@ -631,10 +749,15 @@ final class PlayerViewModel: ObservableObject {
         exportImporter?.cancel()
     }
 
-    /// Returns the subtitle line that should be visible at `time`, if any
+    /// Returns the AI subtitle line that should be visible at `time`, if any
     /// (the translated line, when translation is active).
+    ///
+    /// Suppressed while an embedded subtitle track is active: mpv burns
+    /// those into the frame itself, so showing the AI overlay too would
+    /// stack two lines of text on top of each other. Selecting "Off" for the
+    /// embedded track brings the AI overlay straight back.
     func subtitleText(at time: Double) -> String? {
-        guard subtitlesEnabled else { return nil }
+        guard subtitlesEnabled, currentSubtitleTrackID == 0 else { return nil }
         return displayedSubtitleCues.first(where: { time >= $0.startTime && time <= $0.endTime })?.text
     }
 

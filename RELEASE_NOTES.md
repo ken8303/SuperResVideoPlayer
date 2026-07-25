@@ -58,13 +58,20 @@ audio → Traditional Chinese subtitles) entirely on-device via Apple
 Intelligence.
 
 **Enhanced export.** Re-render a whole file with Super Resolution and frame
-interpolation applied, encoded to HEVC `.mp4` with audio passed through.
+interpolation applied, encoded to HEVC `.mp4` with AAC audio.
 A **Test 10s** button renders a short clip so you can compare settings
 quickly. Export is slower than real time — optical flow dominates.
 
+**Audio & subtitle tracks.** Multi-track files — MKVs with several audio
+languages, commentary, or embedded subtitles — get track pickers in the
+controls bar, the video's right-click menu, and the **Video** menu. The
+selected audio track is the one transcribed and exported, not just the one
+you hear.
+
 **Player basics.** Keyboard shortcuts (Space, ←/→ seek, ↑/↓ volume, M mute,
-F fullscreen), drag-and-drop, fullscreen with auto-hiding controls, and
-settings that persist between launches.
+F fullscreen), drag-and-drop, fullscreen with auto-hiding controls, settings
+reachable from the menu bar or a right-click on the video (so they stay
+available in fullscreen), and settings that persist between launches.
 
 **Live pipeline stats.** A readout showing input→output resolution and real
 vs. synthesized frames per second, so you can confirm the enhancements are

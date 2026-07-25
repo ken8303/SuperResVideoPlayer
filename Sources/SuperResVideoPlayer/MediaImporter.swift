@@ -86,14 +86,19 @@ final class MediaImporter: @unchecked Sendable {
         process?.terminate()
     }
 
-    /// Extracts `url`'s first audio track to a temporary .m4a, reporting
-    /// rough progress (0...1) on the main queue. Returns the cached output
-    /// immediately if this exact file was extracted before.
-    func extractAudio(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
+    /// Extracts one of `url`'s audio tracks to a temporary WAV, reporting
+    /// rough progress (0...1) on the main queue. `audioStreamIndex` is the
+    /// zero-based position among the file's audio streams (container order —
+    /// matches the order mpv lists them in the app's Audio picker). Returns
+    /// the cached output immediately if this exact file+track was extracted
+    /// before.
+    func extractAudio(from url: URL, audioStreamIndex: Int = 0,
+                      onProgress: @escaping (Double) -> Void) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
-                    continuation.resume(returning: try self.extractAudioSync(url: url, onProgress: onProgress))
+                    continuation.resume(returning: try self.extractAudioSync(
+                        url: url, audioStreamIndex: audioStreamIndex, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -105,11 +110,13 @@ final class MediaImporter: @unchecked Sendable {
     /// can always decode. Used as an export fallback when the reader can't
     /// handle the source directly (e.g. 10-bit HEVC). The player's Metal
     /// pipeline is 8-bit anyway, so no additional precision is lost.
-    func transcodeForExport(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
+    func transcodeForExport(from url: URL, audioStreamIndex: Int = 0,
+                            onProgress: @escaping (Double) -> Void) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
-                    continuation.resume(returning: try self.transcodeForExportSync(url: url, onProgress: onProgress))
+                    continuation.resume(returning: try self.transcodeForExportSync(
+                        url: url, audioStreamIndex: audioStreamIndex, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -117,11 +124,13 @@ final class MediaImporter: @unchecked Sendable {
         }
     }
 
-    private func transcodeForExportSync(url: URL, onProgress: @escaping (Double) -> Void) throws -> URL {
+    private func transcodeForExportSync(url: URL, audioStreamIndex: Int,
+                                        onProgress: @escaping (Double) -> Void) throws -> URL {
         guard let ffmpeg = Self.findExecutable("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
         }
-        let outputURL = try cachedOutputURL(for: url, kind: "compat", ext: "mp4")
+        let kind = audioStreamIndex == 0 ? "compat" : "compat-a\(audioStreamIndex)"
+        let outputURL = try cachedOutputURL(for: url, kind: kind, ext: "mp4")
         if FileManager.default.fileExists(atPath: outputURL.path) {
             return outputURL
         }
@@ -132,7 +141,7 @@ final class MediaImporter: @unchecked Sendable {
         let args = [
             "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
             "-i", url.path,
-            "-map", "0:v:0", "-map", "0:a:0?", "-sn",
+            "-map", "0:v:0", "-map", "0:a:\(audioStreamIndex)?", "-sn",
             "-c:v", "h264_videotoolbox", "-pix_fmt", "yuv420p", "-b:v", "20M",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", partialURL.path
@@ -153,11 +162,13 @@ final class MediaImporter: @unchecked Sendable {
     /// Stream-copies H.264/HEVC video (lossless, fast); transcodes other
     /// codecs via the VideoToolbox hardware encoder. Audio goes to AAC
     /// unless already MP4-compatible.
-    func remuxVideoToMP4(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
+    func remuxVideoToMP4(from url: URL, audioStreamIndex: Int = 0,
+                         onProgress: @escaping (Double) -> Void) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
-                    continuation.resume(returning: try self.remuxVideoSync(url: url, onProgress: onProgress))
+                    continuation.resume(returning: try self.remuxVideoSync(
+                        url: url, audioStreamIndex: audioStreamIndex, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -165,12 +176,15 @@ final class MediaImporter: @unchecked Sendable {
         }
     }
 
-    private func remuxVideoSync(url: URL, onProgress: @escaping (Double) -> Void) throws -> URL {
+    private func remuxVideoSync(url: URL, audioStreamIndex: Int,
+                                onProgress: @escaping (Double) -> Void) throws -> URL {
         guard let ffmpeg = Self.findExecutable("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
         }
 
-        let outputURL = try cachedOutputURL(for: url, kind: "video", ext: "mp4")
+        // Keyed per audio track — see extractAudioSync.
+        let kind = audioStreamIndex == 0 ? "video" : "video-a\(audioStreamIndex)"
+        let outputURL = try cachedOutputURL(for: url, kind: kind, ext: "mp4")
         if FileManager.default.fileExists(atPath: outputURL.path) {
             return outputURL
         }
@@ -179,7 +193,11 @@ final class MediaImporter: @unchecked Sendable {
         let copyableVideo: Set<String> = ["h264", "hevc"]
         let copyableAudio: Set<String> = ["aac", "mp3", "alac", "ac3", "eac3"]
         let videoCopy = info.videoCodec.map { copyableVideo.contains($0) } ?? false
-        let audioCopy = info.audioCodec.map { copyableAudio.contains($0) } ?? false
+        // The probe reports the codec of the *first* audio stream only; for
+        // any other selected track just re-encode to AAC rather than trust a
+        // codec we didn't probe.
+        let audioCopy = audioStreamIndex == 0
+            && (info.audioCodec.map { copyableAudio.contains($0) } ?? false)
 
         let partialURL = outputURL.deletingPathExtension().appendingPathExtension("part.mp4")
         try? FileManager.default.removeItem(at: partialURL)
@@ -188,7 +206,7 @@ final class MediaImporter: @unchecked Sendable {
             var args = [
                 "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
                 "-i", url.path,
-                "-map", "0:v:0", "-map", "0:a:0?", "-sn"
+                "-map", "0:v:0", "-map", "0:a:\(audioStreamIndex)?", "-sn"
             ]
             if videoCopy {
                 args += ["-c:v", "copy"]
@@ -224,12 +242,17 @@ final class MediaImporter: @unchecked Sendable {
         return outputURL
     }
 
-    private func extractAudioSync(url: URL, onProgress: @escaping (Double) -> Void) throws -> URL {
+    private func extractAudioSync(url: URL, audioStreamIndex: Int,
+                                  onProgress: @escaping (Double) -> Void) throws -> URL {
         guard let ffmpeg = Self.findExecutable("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
         }
 
-        let outputURL = try cachedOutputURL(for: url, kind: "audio", ext: "wav")
+        // The cache must be keyed per track, or switching the Audio picker
+        // and regenerating subtitles would silently reuse the previous
+        // track's extraction. ("audio" for track 0 keeps old caches valid.)
+        let kind = audioStreamIndex == 0 ? "audio" : "audio-a\(audioStreamIndex)"
+        let outputURL = try cachedOutputURL(for: url, kind: kind, ext: "wav")
         if FileManager.default.fileExists(atPath: outputURL.path) {
             return outputURL
         }
@@ -255,7 +278,7 @@ final class MediaImporter: @unchecked Sendable {
         let args = [
             "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
             "-i", url.path,
-            "-vn", "-sn", "-map", "0:a:0",
+            "-vn", "-sn", "-map", "0:a:\(audioStreamIndex)",
             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
             partialURL.path
         ]

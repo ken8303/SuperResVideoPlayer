@@ -95,6 +95,12 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 640, minHeight: 360)
+        // Right-click the picture for the full settings menu — the only
+        // always-reachable settings surface in full screen once the
+        // controls bar has auto-hidden.
+        .contextMenu {
+            SettingsMenuContent(viewModel: playerViewModel)
+        }
         // Any mouse movement over the picture reveals the controls again.
         .onContinuousHover { phase in
             if case .active = phase { showControlsTemporarily() }
@@ -316,10 +322,61 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            // Audio-track / embedded-subtitle pickers appear only when the
+            // file actually offers a choice (multi-language MKV, etc.).
+            if playerViewModel.audioTracks.count > 1 || !playerViewModel.subtitleTracks.isEmpty {
+                Divider()
+                trackControls
+            }
+
             Divider()
 
             subtitleControls
         }
+    }
+
+    /// Selectors for the container's own audio tracks and embedded subtitle
+    /// tracks — distinct from the AI subtitle generator below.
+    private var trackControls: some View {
+        HStack {
+            if playerViewModel.audioTracks.count > 1 {
+                Text("Audio")
+                    .foregroundStyle(.secondary)
+                Picker("Audio", selection: Binding(
+                    get: { playerViewModel.currentAudioTrackID },
+                    set: { playerViewModel.selectAudioTrack($0) }
+                )) {
+                    ForEach(playerViewModel.audioTracks) { track in
+                        Text(trackLabel(for: track)).tag(track.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 200)
+            }
+
+            Spacer()
+
+            if !playerViewModel.subtitleTracks.isEmpty {
+                Text("Subtitle Track")
+                    .foregroundStyle(.secondary)
+                Picker("Subtitle Track", selection: Binding(
+                    get: { playerViewModel.currentSubtitleTrackID },
+                    set: { playerViewModel.selectSubtitleTrack($0) }
+                )) {
+                    Text("Off").tag(Int64(0))
+                    ForEach(playerViewModel.subtitleTracks) { track in
+                        Text(trackLabel(for: track)).tag(track.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 200)
+                .help("Subtitles embedded in the file, rendered by the player — separate from AI-generated subtitles below.")
+            }
+        }
+    }
+
+    private func trackLabel(for track: MPVPlayer.Track) -> String {
+        videoTrackLabel(for: track)
     }
 
     private var subtitleControls: some View {
@@ -420,6 +477,126 @@ struct ContentView: View {
         return h > 0
             ? String(format: "%d:%02d:%02d", h, m, s)
             : String(format: "%d:%02d", m, s)
+    }
+}
+
+/// Human-readable label for an audio/subtitle track: title and/or language,
+/// falling back to the track number, with a default marker. Shared by the
+/// controls-bar pickers, the video context menu, and the Video menu.
+func videoTrackLabel(for track: MPVPlayer.Track) -> String {
+    var parts: [String] = []
+    if let title = track.title, !title.isEmpty { parts.append(title) }
+    if let lang = track.lang, !lang.isEmpty { parts.append("(\(lang))") }
+    if parts.isEmpty { parts.append("Track \(track.id)") }
+    var label = parts.joined(separator: " ")
+    if track.isDefault { label += " — default" }
+    return label
+}
+
+/// The player's settings, as menu items. Used in two places so settings stay
+/// reachable everywhere: the right-click context menu on the video (works in
+/// full screen after the controls auto-hide) and the "Video" menu in the
+/// menu bar. Pickers render as submenus with checkmarks; Toggles as
+/// checkmarked items.
+///
+/// IMPORTANT: this view must not observe `PlayerViewModel` directly.
+/// `currentTime` publishes several times a second during playback, and every
+/// publish would rebuild the open NSMenu — making it flash and impossible to
+/// interact with. Instead it observes `viewModel.menuState`, which fires
+/// only when a value these menus actually display changes; the view model is
+/// held as a plain reference and all bindings are built by hand.
+struct SettingsMenuContent: View {
+    let viewModel: PlayerViewModel
+    @ObservedObject private var menuState: PlayerViewModel.MenuState
+
+    init(viewModel: PlayerViewModel) {
+        self.viewModel = viewModel
+        self.menuState = viewModel.menuState
+    }
+
+    var body: some View {
+        // --- Container streams -------------------------------------------
+        if viewModel.audioTracks.count > 1 {
+            Picker("Audio Track", selection: Binding(
+                get: { viewModel.currentAudioTrackID },
+                set: { viewModel.selectAudioTrack($0) }
+            )) {
+                ForEach(viewModel.audioTracks) { track in
+                    Text(videoTrackLabel(for: track)).tag(track.id)
+                }
+            }
+        }
+        if !viewModel.subtitleTracks.isEmpty {
+            Picker("Subtitle Track", selection: Binding(
+                get: { viewModel.currentSubtitleTrackID },
+                set: { viewModel.selectSubtitleTrack($0) }
+            )) {
+                Text("Off").tag(Int64(0))
+                ForEach(viewModel.subtitleTracks) { track in
+                    Text(videoTrackLabel(for: track)).tag(track.id)
+                }
+            }
+        }
+        if viewModel.audioTracks.count > 1 || !viewModel.subtitleTracks.isEmpty {
+            Divider()
+        }
+
+        // --- Enhancement pipeline ----------------------------------------
+        Toggle("AI Image Enhancer", isOn: Binding(
+            get: { viewModel.imageEnhancementEnabled },
+            set: { viewModel.imageEnhancementEnabled = $0 }
+        ))
+        Picker("Enhancer Engine", selection: Binding(
+            get: { viewModel.enhancementEngine },
+            set: { viewModel.enhancementEngine = $0 }
+        )) {
+            Text("Classic").tag(EnhancerEngine.classic)
+            Text("Neural").tag(EnhancerEngine.neural)
+            Text("Max").tag(EnhancerEngine.max)
+        }
+        .disabled(!viewModel.imageEnhancementEnabled)
+
+        Toggle("Super Resolution", isOn: Binding(
+            get: { viewModel.superResolutionEnabled },
+            set: { viewModel.superResolutionEnabled = $0 }
+        ))
+        Picker("Upscale Factor", selection: Binding(
+            get: { viewModel.upscaleFactor },
+            set: { viewModel.upscaleFactor = $0 }
+        )) {
+            Text("1.3x").tag(1.3)
+            Text("1.5x").tag(1.5)
+            Text("2.0x").tag(2.0)
+        }
+        .disabled(!viewModel.superResolutionEnabled)
+
+        Picker("AI Frame Interpolation", selection: Binding(
+            get: { viewModel.frameInterpolationMultiplier },
+            set: { viewModel.frameInterpolationMultiplier = $0 }
+        )) {
+            Text("Off").tag(1)
+            Text("2x").tag(2)
+            Text("3x").tag(3)
+        }
+
+        Divider()
+
+        // --- AI subtitles -------------------------------------------------
+        Toggle("AI Subtitles", isOn: Binding(
+            get: { viewModel.subtitlesEnabled },
+            set: { viewModel.subtitlesEnabled = $0 }
+        ))
+        .disabled(viewModel.subtitleCues.isEmpty)
+        if viewModel.isGeneratingSubtitles {
+            Button("Cancel Subtitle Generation") {
+                viewModel.cancelSubtitleGeneration()
+            }
+        } else {
+            Button("Generate Subtitles") {
+                viewModel.generateSubtitles()
+            }
+            .disabled(viewModel.duration == 0)
+        }
     }
 }
 

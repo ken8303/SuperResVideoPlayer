@@ -21,11 +21,16 @@ real time:
 - **AI Frame Interpolation** — 2x/3x motion smoothing: Vision optical flow
   drives Apple's native **MTLFXFrameInterpolator** (2x midpoints) or a
   custom motion-compensated warp kernel (3x, and fallback).
-- **AI Subtitles** — on-device transcription with the macOS 26
-  **SpeechAnalyzer/SpeechTranscriber** API (long-form audio, per-word
-  timestamps), with legacy `SFSpeechRecognizer` as a fallback for extra
-  languages. Language models download on demand; installed ones show
-  "(downloaded)" in the picker.
+- **Audio & subtitle track selection** — multi-track files (MKVs with
+  several audio languages, commentary, or embedded subtitles) get pickers
+  in the controls bar, in the video's right-click menu, and in the **Video**
+  menu. The chosen audio track is what gets transcribed and exported, not
+  just what you hear.
+- **AI Subtitles** — on-device transcription with the
+  **SpeechAnalyzer/SpeechTranscriber** API introduced in macOS 26
+  (long-form audio, per-word timestamps), with legacy `SFSpeechRecognizer`
+  as a fallback for extra languages. Language models download on demand;
+  installed ones show "(downloaded)" in the picker.
 - **AI Subtitle Translation** — translate the generated subtitles (e.g.
   Japanese audio → Traditional Chinese subtitles) fully on-device with the
   **Apple Intelligence** foundation model (`FoundationModels` framework),
@@ -33,7 +38,7 @@ real time:
   profile suited to translating existing media.
 - **Enhanced video export** — re-render the whole file offline with Super
   Resolution and frame interpolation applied, encoded to HEVC `.mp4` with
-  audio passed through. Unlike playback (which skips interpolation when
+  audio re-encoded to AAC. Unlike playback (which skips interpolation when
   optical flow can't keep up in real time), export computes flow for every
   frame pair.
 - **.srt export** of the generated (or translated) subtitles.
@@ -100,7 +105,7 @@ tree bundled into `Contents/Frameworks`, ffmpeg/ffprobe into
 bash make-dist.sh   # → dist/SuperResVideoPlayer.app + dist/SuperResVideoPlayer.zip
 ```
 
-Recipients need Apple Silicon + macOS 26, and must right-click > Open on
+Recipients need Apple Silicon + macOS 27, and must right-click > Open on
 first launch (the app is ad-hoc signed, not notarized).
 
 ## How it works
@@ -126,9 +131,9 @@ libmpv (demux + decode + audio + A/V sync)
   kernel otherwise), then optionally upscales. Synthesized frames are
   cached per (pair, phase) so 120Hz refresh doesn't re-encode identical
   work.
-- Subtitles: audio is transcribed on-device (extracted to a temp `.m4a`
-  first when the container needs it); word timings are grouped into cues by
-  a pause/length heuristic (CJK-aware). Translation rewrites cue text in
+- Subtitles: audio is transcribed on-device (extracted first to a temp
+  16 kHz mono WAV — the selected audio track, not blindly the first); word
+  timings are grouped into cues by a pause/length heuristic (CJK-aware). Translation rewrites cue text in
   batches of 15 through the on-device language model, with per-line retry
   when a batch is rejected or garbled.
 - Export: `AVAssetReader` → the same Metal pipeline (flow computed per
