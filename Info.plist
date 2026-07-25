@@ -38,9 +38,9 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Bundles mpv/libmpv and FFmpeg (LGPL/GPL). See the project README for license details.</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>27.0</string>
 	<!-- Lets Finder offer this app under "Open With" for video files, and
