@@ -27,4 +27,36 @@ public enum VideoMath {
                         Double(maxDimension) / Double(inputHeight))
         return min(requestedFactor, limit)
     }
+
+    /// Bits per component, parsed from an FFmpeg/mpv pixel-format name.
+    ///
+    /// mpv exposes no bit-depth property (`video-params/average-bpp` is bits
+    /// per *pixel* averaged over subsampled planes, which is a different
+    /// number), so the depth has to come from the format name. It follows the
+    /// plane marker: "yuv420p10le" → 10, "p010" → 10, "gbrp12le" → 12, while
+    /// 8-bit formats carry no suffix ("yuv420p" → 8).
+    ///
+    /// Scanning *after* a "p" rather than searching for "10" anywhere is what
+    /// keeps subsampling digits from being misread — "yuv410p" is 8-bit.
+    public static func bitDepth(fromPixelFormat format: String?) -> Int {
+        guard let format, !format.isEmpty else { return 8 }
+        var found: Int?
+        var index = format.startIndex
+        while index < format.endIndex {
+            guard format[index] == "p" else {
+                index = format.index(after: index)
+                continue
+            }
+            var digits = ""
+            var scan = format.index(after: index)
+            while scan < format.endIndex, format[scan].isNumber {
+                digits.append(format[scan])
+                scan = format.index(after: scan)
+            }
+            if let value = Int(digits) { found = value }
+            index = scan > index ? scan : format.index(after: index)
+        }
+        guard let found, (8...16).contains(found) else { return 8 }
+        return found
+    }
 }

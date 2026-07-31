@@ -84,6 +84,43 @@ final class PlayerViewModel: ObservableObject {
         didSet { if oldValue != currentSubtitleTrackID { menuState.changed() } }
     }
 
+    /// Color characteristics of the current video (HDR vs SDR, bit depth).
+    /// Surfaced so the user knows when an HDR source is being tone-mapped —
+    /// this player's render path is 8-bit, so HDR is always converted down.
+    @Published private(set) var colorInfo: MPVPlayer.ColorInfo?
+
+    /// True while the HDR signal is being passed through to the display
+    /// rather than tone-mapped. Drives the layer's colour space.
+    @Published private(set) var hdrOutputActive = false
+
+    /// Whether any attached display can actually show more than SDR white.
+    ///
+    /// This gates HDR passthrough, and its absence was a real bug: handing
+    /// PQ to a display with no extended range doesn't produce HDR, it
+    /// *clips* — highlights slam to white while everything else looks
+    /// roughly normal. Every log line said HDR was working; the picture
+    /// disagreed, because the display had nowhere to put the extra range.
+    ///
+    /// `maximumPotential…` is the right property: it reports what the
+    /// display can do, rather than the headroom available at this instant
+    /// (which drops when the panel is bright or warm).
+    static var displaySupportsHDR: Bool {
+        let headroom = NSScreen.screens
+            .map(\.maximumPotentialExtendedDynamicRangeColorComponentValue)
+            .max() ?? 1.0
+        // A little above 1.0 to ignore rounding on plain SDR panels.
+        return headroom > 1.05
+    }
+
+    /// One-line note shown in the UI for HDR sources — either confirming HDR
+    /// is reaching the display, or explaining the tone-map. nil for SDR.
+    var hdrNotice: String? {
+        guard let colorInfo, colorInfo.isHDR else { return nil }
+        return hdrOutputActive
+            ? "\(colorInfo.description) — HDR output"
+            : "\(colorInfo.description) — tone-mapped to SDR"
+    }
+
     /// One-line description of whatever long-running background work is in
     /// flight (audio extraction, model downloads, transcription,
     /// translation, export), shown in the UI's status row. nil = idle.
@@ -225,6 +262,7 @@ final class PlayerViewModel: ObservableObject {
 
     /// libmpv-backed engine. The Metal renderer reads frames from it
     /// directly (via the settings snapshot pushed in MetalVideoView).
+    ///
     let mpv = MPVPlayer()
 
     /// Keys + typed accessors for the settings that persist across launches.
@@ -296,7 +334,22 @@ final class PlayerViewModel: ObservableObject {
         restoreSettings()
         // Observers don't fire during init — push the restored volume through.
         mpv.setVolume(volume)
+        wirePlayerCallbacks()
 
+        // Let the subtitle generator surface its internal phases (model
+        // download, transcription) in the status row.
+        subtitleGenerator.onStatus = { [weak self] status in
+            self?.statusMessage = status
+        }
+
+        Task { @MainActor in
+            await self.refreshInstalledSpeechLocales()
+        }
+    }
+
+    /// Attaches the view model's handlers to `mpv`. Called from `init` and
+    /// again whenever the engine is rebuilt for an output-mode change.
+    private func wirePlayerCallbacks() {
         // mpv event callbacks (all delivered on the main queue).
         mpv.onTimeChanged = { [weak self] seconds in
             guard let self, !self.isScrubbing else { return }
@@ -321,6 +374,40 @@ final class PlayerViewModel: ObservableObject {
             self.playbackErrorMessage = "Couldn't play this video: \(message)"
             self.isPlaying = false
         }
+        mpv.onColorInfoChanged = { [weak self] info in
+            guard let self else { return }
+            guard self.colorInfo != info else { return }
+            self.colorInfo = info
+
+            // HDR passthrough is only safe on the 16-bit path — PQ at 8 bits
+            // per channel bands badly, so tone-map instead if libmpv fell
+            // back to the 8-bit format.
+            let wantPassThrough = info.isHDR
+                && self.mpv.usingHighBitDepth
+                && Self.displaySupportsHDR
+            // Only claim HDR if mpv confirms it accepted the PQ target —
+            // otherwise the layer would be tagged PQ while mpv is still
+            // sending SDR, which looks badly wrong.
+            let accepted = self.mpv.setHDRPassthrough(wantPassThrough)
+            self.hdrOutputActive = accepted
+
+            if info.isHDR {
+                let headroom = NSScreen.screens
+                    .map(\.maximumPotentialExtendedDynamicRangeColorComponentValue)
+                    .max() ?? 1.0
+                let reason: String
+                if accepted {
+                    reason = "HDR output active"
+                } else if !Self.displaySupportsHDR {
+                    reason = String(format: "tone-mapped to SDR (display headroom %.2f — no extended range)", headroom)
+                } else if !self.mpv.usingHighBitDepth {
+                    reason = "tone-mapped to SDR (8-bit render path)"
+                } else {
+                    reason = "tone-mapped to SDR"
+                }
+                print("SuperResVideoPlayer: \(info.description) — \(reason)")
+            }
+        }
         mpv.onTracksChanged = { [weak self] tracks in
             guard let self else { return }
             self.audioTracks = tracks.filter { $0.kind == .audio }
@@ -329,16 +416,6 @@ final class PlayerViewModel: ObservableObject {
             // right row (a subtitle track may be auto-selected as default).
             self.currentAudioTrackID = self.audioTracks.first(where: { $0.isSelected })?.id ?? 0
             self.currentSubtitleTrackID = self.subtitleTracks.first(where: { $0.isSelected })?.id ?? 0
-        }
-
-        // Let the subtitle generator surface its internal phases (model
-        // download, transcription) in the status row.
-        subtitleGenerator.onStatus = { [weak self] status in
-            self?.statusMessage = status
-        }
-
-        Task { @MainActor in
-            await self.refreshInstalledSpeechLocales()
         }
     }
 
@@ -436,6 +513,7 @@ final class PlayerViewModel: ObservableObject {
         subtitleTracks = []
         currentAudioTrackID = 0
         currentSubtitleTrackID = 0
+        colorInfo = nil
 
         // A new video invalidates any subtitles (and in-flight
         // transcription) generated for the previous one.
@@ -517,6 +595,7 @@ final class PlayerViewModel: ObservableObject {
         mpv.setSubtitleTrack(id == 0 ? nil : id)
         currentSubtitleTrackID = id
     }
+
 
     // MARK: AI Subtitle Generator
 

@@ -16,11 +16,29 @@ cd "$(dirname "$0")"
 # Macs block dsymutil from writing the .dSYM bundle ("cannot create Plist:
 # Operation not permitted"), which would otherwise fail the build. Debug
 # symbols aren't needed just to run the app.
-swift build -Xswiftc -gnone
+# Build artefacts go OUTSIDE the project folder.
+#
+# This repo lives in an iCloud-synced directory (Desktop & Documents), whose
+# file provider continuously re-attaches xattrs to anything created there.
+# codesign then refuses with "resource fork, Finder information, or similar
+# detritus not allowed" — a race that can't be won in-place. /tmp isn't
+# managed by the file provider, so builds there stay clean. This also keeps
+# multi-GB build products from being uploaded to iCloud.
+SCRATCH="${TMPDIR:-/tmp}"
+SCRATCH="${SCRATCH%/}/SuperResVideoPlayer-build"   # TMPDIR ends in "/" on macOS
+mkdir -p "$SCRATCH"
 
-BIN=.build/debug/SuperResVideoPlayer
-BUNDLE_SRC=.build/debug/SuperResVideoPlayer_SuperResVideoPlayer.bundle
-APP=.build/SuperResVideoPlayer.app
+swift build --scratch-path "$SCRATCH" -Xswiftc -gnone
+
+# Ask SwiftPM where it actually put the products: the layout differs between
+# build systems ("debug/" for the native one, "out/Products/Debug/" for the
+# Xcode one) and the default has changed between toolchains.
+BIN_DIR="$(swift build --scratch-path "$SCRATCH" -Xswiftc -gnone --show-bin-path)"
+BIN="$BIN_DIR/SuperResVideoPlayer"
+BUNDLE_SRC="$BIN_DIR/SuperResVideoPlayer_SuperResVideoPlayer.bundle"
+# The .app is assembled and signed in the scratch dir too — signing it
+# inside the iCloud-synced project folder is what fails.
+APP="$SCRATCH/SuperResVideoPlayer.app"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

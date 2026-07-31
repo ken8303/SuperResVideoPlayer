@@ -373,12 +373,16 @@ final class MediaImporter: @unchecked Sendable {
         var videoCodec: String?
         var audioCodec: String?
         var duration: Double
+        /// Transfer characteristics of the first video stream, e.g.
+        /// "smpte2084" (HDR10/PQ) or "arib-std-b67" (HLG). nil when untagged.
+        var colorTransfer: String?
     }
+
 
     /// Asks ffprobe what's inside the file. Failing softly just means the
     /// audio gets transcoded rather than stream-copied.
     private func probe(url: URL) -> ProbeInfo {
-        let fallback = ProbeInfo(videoCodec: nil, audioCodec: nil, duration: 0)
+        let fallback = ProbeInfo(videoCodec: nil, audioCodec: nil, duration: 0, colorTransfer: nil)
         guard let ffprobe = Self.findExecutable("ffprobe") else { return fallback }
 
         let process = Process()
@@ -405,6 +409,7 @@ final class MediaImporter: @unchecked Sendable {
                 let type = stream["codec_type"] as? String
                 if type == "video", result.videoCodec == nil {
                     result.videoCodec = stream["codec_name"] as? String
+                    result.colorTransfer = stream["color_transfer"] as? String
                 }
                 if type == "audio", result.audioCodec == nil {
                     result.audioCodec = stream["codec_name"] as? String

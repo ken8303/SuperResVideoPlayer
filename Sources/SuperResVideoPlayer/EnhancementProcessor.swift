@@ -22,6 +22,9 @@ final class EnhancementProcessor {
     }
 
     private let device: MTLDevice
+    /// Pixel format of the textures flowing through this processor. Defaults
+    /// to 8-bit for the export path; playback passes its 16-bit format.
+    private let pixelFormat: MTLPixelFormat
     private let enhancePipeline: MTLComputePipelineState
     private let downsamplePipeline: MTLComputePipelineState
 
@@ -32,7 +35,7 @@ final class EnhancementProcessor {
     private var lastSize: (width: Int, height: Int) = (0, 0)
     private(set) var neuralSupported = true
 
-    init?(device: MTLDevice, library: MTLLibrary) {
+    init?(device: MTLDevice, library: MTLLibrary, pixelFormat: MTLPixelFormat = .bgra8Unorm) {
         guard let enhanceFn = library.makeFunction(name: "enhanceKernel"),
               let downsampleFn = library.makeFunction(name: "downsampleKernel"),
               let enhance = try? device.makeComputePipelineState(function: enhanceFn),
@@ -40,6 +43,7 @@ final class EnhancementProcessor {
             return nil
         }
         self.device = device
+        self.pixelFormat = pixelFormat
         self.enhancePipeline = enhance
         self.downsamplePipeline = downsample
     }
@@ -101,8 +105,8 @@ final class EnhancementProcessor {
             descriptor.inputHeight = height
             descriptor.outputWidth = width * 2
             descriptor.outputHeight = height * 2
-            descriptor.colorTextureFormat = .bgra8Unorm
-            descriptor.outputTextureFormat = .bgra8Unorm
+            descriptor.colorTextureFormat = pixelFormat
+            descriptor.outputTextureFormat = pixelFormat
             descriptor.colorProcessingMode = .perceptual
             guard let scaler = descriptor.makeSpatialScaler(device: device),
                   let upscaled = makeTexture(width: width * 2, height: height * 2, renderTarget: true),
@@ -118,7 +122,7 @@ final class EnhancementProcessor {
 
     private func makeTexture(width: Int, height: Int, renderTarget: Bool) -> MTLTexture? {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
+            pixelFormat: pixelFormat, width: width, height: height, mipmapped: false
         )
         descriptor.usage = renderTarget ? [.shaderRead, .shaderWrite, .renderTarget]
                                         : [.shaderRead, .shaderWrite]

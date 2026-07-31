@@ -58,16 +58,16 @@ there's nothing else to install.
 3. If macOS says the app is damaged:
    `xattr -dc /Applications/SuperResVideoPlayer.app`
 
-Needs an Apple Silicon Mac on macOS 27. Everything below is for building
+Needs an Apple Silicon Mac on macOS 26 or later. Everything below is for building
 from source instead.
 
 ## Requirements
 
 - Apple Silicon Mac (MetalFX requires an Apple-family GPU).
-- **macOS 27 "Golden Gate" or later** (deployment target; built against the
-  macOS 27 SDK). Underlying APIs — `MTLFXFrameInterpolator` (Metal 4),
-  SpeechAnalyzer, Foundation Models — first shipped in macOS 26; macOS 27
-  adds the improved on-device translation model.
+- **macOS 26 or later.** That's the real floor: the newest frameworks used
+  here — `MTLFXFrameInterpolator` (Metal 4), SpeechAnalyzer, Foundation
+  Models — all shipped in macOS 26. macOS 27 is still worth having for its
+  improved on-device translation model, but nothing requires it.
 - Xcode 27+ / a Swift 6.2+ toolchain to build.
 - **libmpv**: `brew install mpv`
 - **ffmpeg**: `brew install ffmpeg` — required for *subtitle generation on
@@ -105,14 +105,14 @@ tree bundled into `Contents/Frameworks`, ffmpeg/ffprobe into
 bash make-dist.sh   # → dist/SuperResVideoPlayer.app + dist/SuperResVideoPlayer.zip
 ```
 
-Recipients need Apple Silicon + macOS 27, and must right-click > Open on
+Recipients need Apple Silicon + macOS 26 or later, and must right-click > Open on
 first launch (the app is ad-hoc signed, not notarized).
 
 ## How it works
 
 ```
 libmpv (demux + decode + audio + A/V sync)
-   └─ software render API → BGRA CVPixelBuffer   (MPVPlayer.swift, dedicated queue)
+   └─ software render API → 16-bit RGBA CVPixelBuffer (MPVPlayer.swift, dedicated queue)
         └─ zero-copy Metal texture wrap           (Renderer.swift, MTKView draw loop)
              ├─ AI Frame Interpolation            (Vision optical flow → MetalFX / warp kernel)
              ├─ MetalFX Super Resolution          (spatial scaler)
@@ -156,8 +156,10 @@ libmpv (demux + decode + audio + A/V sync)
   following along, not fansub grade. A few lines may be skipped by the
   model's content filter (they keep the original text; the UI reports how
   many).
-- The video render path is 8-bit BGRA without color management; HDR
-  sources are tone-mapped by mpv to SDR.
+- The video render path is 16-bit RGBA. HDR10/HLG sources are passed
+  through as PQ to a display with extended dynamic range, and tone-mapped
+  (BT.2390) otherwise — including on "HDR ready" monitors whose actual peak
+  brightness is around SDR levels, where passthrough would just clip.
 
 ## File map
 

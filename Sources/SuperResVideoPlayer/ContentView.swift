@@ -16,23 +16,35 @@ struct ContentView: View {
     @State private var hideControlsTask: Task<Void, Never>?
 
     var body: some View {
-        Group {
+        // One structure for both layouts, on purpose.
+        //
+        // This used to be `if isFullScreen { ZStack } else { VStack }`, which
+        // SwiftUI treats as two unrelated view trees: toggling full screen
+        // tore down the whole video subtree and built a fresh MTKView. That
+        // meant a visible reset on every transition, the display layer losing
+        // its colour-space tag, and (before RendererStore) a duplicated set
+        // of Metal resources.
+        //
+        // Keeping `videoArea` as the first child of the same VStack inside
+        // the same ZStack preserves its identity, so the transition only
+        // changes where the controls sit — not what the video view *is*.
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 0) {
+                videoArea
+                // In full screen the bar is overlaid instead, so it can fade
+                // out and leave full-frame video.
+                if !isFullScreen {
+                    controlsBar
+                }
+            }
             if isFullScreen {
-                // Overlay the controls so hiding them yields full-frame video.
-                ZStack(alignment: .bottom) {
-                    videoArea
-                    controlsBar
-                        .opacity(controlsVisible ? 1 : 0)
-                        .allowsHitTesting(controlsVisible)
-                }
-            } else {
-                VStack(spacing: 0) {
-                    videoArea
-                    controlsBar
-                }
-                .frame(minWidth: 720, minHeight: 480)
+                controlsBar
+                    .opacity(controlsVisible ? 1 : 0)
+                    .allowsHitTesting(controlsVisible)
             }
         }
+        .frame(minWidth: isFullScreen ? nil : 720,
+               minHeight: isFullScreen ? nil : 480)
         .navigationTitle(playerViewModel.videoTitle)
         // Opening a video from Finder ("Open With", or dropping it on the
         // Dock icon) delivers the file here — without this the app would
@@ -322,6 +334,16 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            // HDR sources are always tone-mapped down (the render path is
+            // 8-bit); say so rather than silently changing how it looks.
+            if let notice = playerViewModel.hdrNotice {
+                Label(notice, systemImage: "sun.max")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help("mpv's software render API outputs 8 bits per channel, so HDR is converted to SDR before the Metal pipeline sees it. Tone-mapping uses the BT.2390 curve with per-scene peak detection.")
+            }
+
             // Audio-track / embedded-subtitle pickers appear only when the
             // file actually offers a choice (multi-language MKV, etc.).
             if playerViewModel.audioTracks.count > 1 || !playerViewModel.subtitleTracks.isEmpty {
@@ -378,6 +400,7 @@ struct ContentView: View {
     private func trackLabel(for track: MPVPlayer.Track) -> String {
         videoTrackLabel(for: track)
     }
+
 
     private var subtitleControls: some View {
         VStack(alignment: .leading, spacing: 6) {

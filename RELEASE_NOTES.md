@@ -23,6 +23,12 @@ render through the player engine, independently of the AI subtitles. When an
 embedded track is showing, the AI subtitle overlay steps aside so the two
 can't stack on top of each other.
 
+**HDR sources are labelled.** HDR10 and HLG content is detected and reported
+in the controls bar — including bit depth and mastering luminance — so you
+know when a file is being tone-mapped rather than wondering why it looks
+flat. When passthrough is off, the tone-map is better than before too:
+BT.2390 with per-scene peak detection.
+
 **CJK subtitles render properly.** Recent macOS moved its bundled Chinese
 font into a protected location the subtitle renderer can't open, so Chinese,
 Japanese and Korean subtitles appeared as empty boxes. The player now uses a
@@ -45,7 +51,7 @@ to leave full screen.
 ## Requirements
 
 - Apple Silicon Mac (M-series)
-- macOS 27 "Golden Gate" or later
+- macOS 26 or later (macOS 27 gives better on-device subtitle translation)
 - Optional: **Apple Intelligence** enabled, for subtitle translation
 
 ## Installing
@@ -121,7 +127,16 @@ actually running.
 - Subtitle cue breaks use a pause/length heuristic, not sentence detection.
 - Translation quality is on-device-LLM grade: good for following along, not
   fansub grade. A few lines may be skipped by the model's content filter.
-- Video is processed as 8-bit; HDR sources are tone-mapped to SDR.
+- **HDR output needs a display with real headroom.** HDR10 and HLG files
+  play at full bit depth through a 16-bit pipeline, and the enhancements
+  still work on them. But passthrough only engages when an attached display
+  actually reports extended dynamic range — on an ordinary SDR panel, or an
+  "HDR ready" monitor whose peak brightness is around SDR levels, the signal
+  is tone-mapped with the BT.2390 curve instead. That is the correct result:
+  sending 1000-nit content to a 300-nit panel clips highlights to white.
+  The controls bar says which is happening.
+- Multi-channel audio is downmixed to stereo AAC on export, so 5.1 and
+  Atmos tracks lose their surround channels in the exported file.
 - Subtitles need an audio track — video-only files report this clearly.
 - The subtitle font covers Chinese well; a few Traditional-only or Korean
   glyphs may fall back. Bundling Noto Sans CJK would remove this entirely.

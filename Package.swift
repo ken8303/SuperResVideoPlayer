@@ -1,6 +1,6 @@
 // swift-tools-version:6.4
-// (6.4+ is required for PackageDescription to expose `.macOS(.v27)` below;
-// ships with the Xcode 27 toolchain.)
+// (ships with the Xcode 27 toolchain, which is what this is built with —
+// the deployment target below is deliberately lower, see `platforms`.)
 import PackageDescription
 import Foundation
 
@@ -16,11 +16,16 @@ let infoPlistPath = URL(fileURLWithPath: #filePath)
 let package = Package(
     name: "SuperResVideoPlayer",
     platforms: [
-        // Targets macOS 27, built against the macOS 27 SDK. Requires the
-        // Xcode 27 toolchain to be the *active* one — if `.v27` fails to
-        // resolve, run `sudo xcode-select -s /Applications/Xcode-beta.app`
-        // (the build is still picking up the 26.x SDK otherwise).
-        .macOS(.v27)
+        // macOS 26 is the real floor: every framework this app depends on
+        // that isn't long-standing arrived in 26 — MTLFXFrameInterpolator
+        // (Metal 4) for frame interpolation, SpeechAnalyzer for subtitles,
+        // and FoundationModels for translation. Nothing here needs 27; that
+        // only ships a better on-device translation *model*, which is a
+        // quality difference rather than an API requirement.
+        //
+        // Still built with the Xcode 27 toolchain against the 27 SDK — the
+        // deployment target is what decides which systems can run it.
+        .macOS(.v26)
     ],
     targets: [
         // libmpv (the engine inside mpv/IINA) handles demuxing and decoding

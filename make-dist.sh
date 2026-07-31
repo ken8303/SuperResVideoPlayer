@@ -20,10 +20,25 @@ cd "$(dirname "$0")"
 echo "==> Building (release)…"
 # -gnone skips the dsymutil step some Macs block (see make-app.sh); a
 # shipped binary doesn't need a dSYM anyway.
-swift build -c release -Xswiftc -gnone
+# Build artefacts go OUTSIDE the project folder.
+#
+# This repo lives in an iCloud-synced directory (Desktop & Documents), whose
+# file provider continuously re-attaches xattrs to anything created there.
+# codesign then refuses with "resource fork, Finder information, or similar
+# detritus not allowed" — a race that can't be won in-place. /tmp isn't
+# managed by the file provider, so builds there stay clean. This also keeps
+# multi-GB build products from being uploaded to iCloud.
+SCRATCH="${TMPDIR:-/tmp}"
+SCRATCH="${SCRATCH%/}/SuperResVideoPlayer-build"   # TMPDIR ends in "/" on macOS
+mkdir -p "$SCRATCH"
 
-BIN=.build/release/SuperResVideoPlayer
-BUNDLE_SRC=.build/release/SuperResVideoPlayer_SuperResVideoPlayer.bundle
+swift build -c release --scratch-path "$SCRATCH" -Xswiftc -gnone
+
+# Ask SwiftPM where the products are — the layout differs between build
+# systems and the default has changed between toolchains.
+BIN_DIR="$(swift build -c release --scratch-path "$SCRATCH" -Xswiftc -gnone --show-bin-path)"
+BIN="$BIN_DIR/SuperResVideoPlayer"
+BUNDLE_SRC="$BIN_DIR/SuperResVideoPlayer_SuperResVideoPlayer.bundle"
 DIST=dist
 REPO="$PWD"
 
@@ -205,7 +220,7 @@ echo "Done:"
 echo "  $DIST/SuperResVideoPlayer.app   <- for local testing"
 echo "  $DIST/SuperResVideoPlayer.zip   <- share this"
 echo ""
-echo "Recipients need: Apple Silicon Mac on macOS 27. Nothing to install."
+echo "Recipients need: Apple Silicon Mac on macOS 26+. Nothing to install."
 echo "First launch: right-click the app > Open (it is ad-hoc signed, not"
 echo "notarized). If macOS says it is damaged, they should run:"
 echo "  xattr -dc /Applications/SuperResVideoPlayer.app"

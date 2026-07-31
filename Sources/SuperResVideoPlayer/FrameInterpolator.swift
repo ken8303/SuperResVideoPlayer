@@ -33,6 +33,9 @@ import MetalFX
 final class FrameInterpolator {
 
     private let device: MTLDevice
+    /// Pixel format of the frames being interpolated (see
+    /// EnhancementProcessor for why this is parameterised).
+    private let pixelFormat: MTLPixelFormat
     private var interpolator: (any MTLFXFrameInterpolator)?
     private var depthTexture: MTLTexture?
     private var outputTexture: MTLTexture?
@@ -44,8 +47,9 @@ final class FrameInterpolator {
     /// reports no support, so `Renderer` can stop calling into this class.
     private(set) var isSupported = true
 
-    init(device: MTLDevice) {
+    init(device: MTLDevice, pixelFormat: MTLPixelFormat = .bgra8Unorm) {
         self.device = device
+        self.pixelFormat = pixelFormat
     }
 
     /// Returns the interpolated midpoint frame between `previous` and
@@ -126,10 +130,10 @@ final class FrameInterpolator {
         descriptor.inputHeight = height
         descriptor.outputWidth = width
         descriptor.outputHeight = height
-        descriptor.colorTextureFormat = .bgra8Unorm
+        descriptor.colorTextureFormat = pixelFormat
         descriptor.depthTextureFormat = .r32Float
         descriptor.motionTextureFormat = .rg32Float
-        descriptor.outputTextureFormat = .bgra8Unorm
+        descriptor.outputTextureFormat = pixelFormat
 
         guard let newInterpolator = descriptor.makeFrameInterpolator(device: device) else {
             print("SuperResVideoPlayer: failed to create MTLFXFrameInterpolator.")
@@ -144,7 +148,7 @@ final class FrameInterpolator {
         guard let newDepthTexture = device.makeTexture(descriptor: depthDescriptor) else { return false }
 
         let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
+            pixelFormat: pixelFormat, width: width, height: height, mipmapped: false
         )
         outputDescriptor.usage = newInterpolator.outputTextureUsage
         outputDescriptor.storageMode = .private
