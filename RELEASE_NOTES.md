@@ -6,8 +6,9 @@ real time with Apple Silicon's MetalFX and on-device AI.
 **Download:** `SuperResVideoPlayer.zip` below. Nothing else to install —
 the player engine (libmpv) and its media tools are bundled inside the app.
 
-> **Pre-release.** This build focuses on multi-track files and on making the
-> settings reachable in full screen. Please report anything that misbehaves.
+> **Pre-release.** This build adds HDR10 output, multi-track audio and
+> subtitle selection, and lowers the requirement to macOS 26. Please report
+> anything that misbehaves.
 
 ## What's new since 1.0
 
@@ -23,11 +24,19 @@ render through the player engine, independently of the AI subtitles. When an
 embedded track is showing, the AI subtitle overlay steps aside so the two
 can't stack on top of each other.
 
-**HDR sources are labelled.** HDR10 and HLG content is detected and reported
-in the controls bar — including bit depth and mastering luminance — so you
-know when a file is being tone-mapped rather than wondering why it looks
-flat. When passthrough is off, the tone-map is better than before too:
-BT.2390 with per-scene peak detection.
+**HDR10 output, without giving up the enhancements.** The playback pipeline
+now runs at 16 bits per channel instead of 8, which is what makes this
+possible: HDR10 and HLG files are passed through as PQ to a display with
+real extended dynamic range, while Super Resolution, frame interpolation and
+the image enhancer keep working on them. On an ordinary SDR display — or an
+"HDR ready" monitor whose actual peak brightness is around SDR levels — the
+signal is tone-mapped instead, with the BT.2390 curve and per-scene peak
+detection rather than a naive clip. The controls bar reports which is
+happening, along with the file's bit depth and mastering luminance.
+
+**Runs on macOS 26.** The previous build required macOS 27; nothing in the
+app actually needed it. macOS 27 still gives better on-device subtitle
+translation.
 
 **CJK subtitles render properly.** Recent macOS moved its bundled Chinese
 font into a protected location the subtitle renderer can't open, so Chinese,
@@ -43,6 +52,12 @@ to leave full screen.
 **Fixes**
 - Menu-bar and context menus no longer flicker or refuse clicks during
   playback (they were rebuilding several times a second).
+- Fixed a crash when the playback engine was torn down while the app kept
+  running — two threads could free the same handle.
+- Entering full screen no longer rebuilds the video view, which previously
+  reset the picture and lost the display's colour-space setting.
+- The video view no longer multiplies GPU resources when the window's
+  layout changes.
 - Subtitle and export caches are keyed per audio track, so switching tracks
   can't reuse the previous track's extracted audio.
 - Corrected the docs: export re-encodes audio to AAC rather than copying it
