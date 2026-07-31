@@ -1,4 +1,4 @@
-# SuperRes Video Player 1.1 (pre-release)
+# SuperRes Video Player 1.2 (pre-release)
 
 A native macOS video player that plays almost anything and enhances it in
 real time with Apple Silicon's MetalFX and on-device AI.
@@ -10,7 +10,7 @@ the player engine (libmpv) and its media tools are bundled inside the app.
 > subtitle selection, and lowers the requirement to macOS 26. Please report
 > anything that misbehaves.
 
-## What's new since 1.0
+## What's new
 
 **Audio track selection.** Files with several audio tracks — a second
 language, a director's commentary — now get an **Audio** picker. The
