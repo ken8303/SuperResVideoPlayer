@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 /// Pure numeric helpers for the video pipeline, extracted so the "magic
 /// number" formulas can be unit-tested independently of Metal/AVFoundation.
@@ -6,6 +7,29 @@ public enum VideoMath {
 
     /// Metal 2D-texture side limit on Apple-family GPUs.
     public static let maxTextureDimension = 16384
+
+    /// Whether playback should ask libmpv for PQ passthrough. All three
+    /// conditions are required: an HDR source, the 16-bit software output
+    /// path, and meaningful extended-range display headroom.
+    public static func shouldAttemptHDRPassthrough(
+        sourceIsHDR: Bool,
+        usingHighBitDepth: Bool,
+        displayHeadroom: Double
+    ) -> Bool {
+        sourceIsHDR && usingHighBitDepth && displayHeadroom.isFinite && displayHeadroom > 1.05
+    }
+
+    /// Recognizes the transfer-function spellings exposed by AVFoundation,
+    /// ffmpeg, and mpv for the two HDR standards supported by playback.
+    public static func isHDRTransferFunction(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let normalized = value.lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        return [
+            "pq", "st2084", "smpte2084", "smpte-st2084", "smpte-st-2084-pq",
+            "hlg", "arib-std-b67", "itu-r-2100-hlg"
+        ].contains(normalized)
+    }
 
     /// A target average bitrate for the HEVC export, scaled by pixel count
     /// and frame rate (~0.07 bits per pixel per second), clamped to a sane
@@ -26,6 +50,62 @@ public enum VideoMath {
         let limit = min(Double(maxDimension) / Double(inputWidth),
                         Double(maxDimension) / Double(inputHeight))
         return min(requestedFactor, limit)
+    }
+
+    /// Pixel dimensions for an upscale request, clamped to Metal's limit and
+    /// rounded down to an encoder-friendly alignment where possible.
+    public static func upscaledDimensions(
+        inputWidth: Int,
+        inputHeight: Int,
+        requestedFactor: Double,
+        maxDimension: Int = maxTextureDimension,
+        alignment: Int = 2
+    ) -> (width: Int, height: Int) {
+        guard inputWidth > 0, inputHeight > 0,
+              requestedFactor.isFinite, requestedFactor > 1,
+              maxDimension > 0 else { return (inputWidth, inputHeight) }
+
+        let factor = clampedUpscaleFactor(
+            inputWidth: inputWidth,
+            inputHeight: inputHeight,
+            requestedFactor: requestedFactor,
+            maxDimension: maxDimension)
+        guard factor > 1 else { return (inputWidth, inputHeight) }
+
+        func dimension(_ input: Int) -> Int {
+            var output = min(maxDimension, max(input, Int(Double(input) * factor)))
+            if alignment > 1, output >= alignment {
+                let aligned = output - output % alignment
+                if aligned >= input { output = aligned }
+            }
+            return output
+        }
+        return (dimension(inputWidth), dimension(inputHeight))
+    }
+
+    /// Carries a video's display transform (most commonly a 90-degree phone
+    /// rotation) from its decoded dimensions to a resized export. This is a
+    /// conjugation by the input→output scale: `S × T × S⁻¹`.
+    public static func scaledTrackTransform(
+        _ transform: CGAffineTransform,
+        inputWidth: Int,
+        inputHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int
+    ) -> CGAffineTransform {
+        guard inputWidth > 0, inputHeight > 0,
+              outputWidth > 0, outputHeight > 0 else { return transform }
+
+        let scaleX = CGFloat(outputWidth) / CGFloat(inputWidth)
+        let scaleY = CGFloat(outputHeight) / CGFloat(inputHeight)
+        return CGAffineTransform(
+            a: transform.a,
+            b: transform.b * scaleY / scaleX,
+            c: transform.c * scaleX / scaleY,
+            d: transform.d,
+            tx: transform.tx * scaleX,
+            ty: transform.ty * scaleY
+        )
     }
 
     /// Bits per component, parsed from an FFmpeg/mpv pixel-format name.

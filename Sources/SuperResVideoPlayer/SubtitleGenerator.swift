@@ -1,4 +1,8 @@
-import Speech
+// Speech's Objective-C request types have not adopted Sendable annotations,
+// although their asynchronous request API is designed to be fed from a
+// worker queue. Import with pre-concurrency semantics until Apple annotates
+// the framework.
+@preconcurrency import Speech
 import AVFoundation
 import Foundation
 import SuperResCore
@@ -36,6 +40,22 @@ enum SubtitleGenerationError: LocalizedError {
 ///     the last utterance (the classic "my subtitles are one line" bug),
 ///     so it's only used when there's no alternative.
 final class SubtitleGenerator {
+
+    /// Narrow bridge from the GCD audio-feeder closure back to the generator.
+    /// Swift weak references are thread-safe; the generator's continuation is
+    /// itself protected by `continuationLock`.
+    private final class LegacyReadFailureHandler: @unchecked Sendable {
+        weak var generator: SubtitleGenerator?
+
+        init(generator: SubtitleGenerator) {
+            self.generator = generator
+        }
+
+        func report(_ error: Error) {
+            generator?.resumePending(
+                throwing: SubtitleGenerationError.recognitionFailed(error))
+        }
+    }
 
     /// Requests Speech Recognition authorization if not already granted
     /// (only the legacy engine needs this; SpeechAnalyzer transcribes
@@ -307,6 +327,7 @@ final class SubtitleGenerator {
             }
 
             // Stream the whole file into the recognizer in PCM chunks.
+            let readFailureHandler = LegacyReadFailureHandler(generator: self)
             DispatchQueue.global(qos: .userInitiated).async {
                 let format = audioFile.processingFormat
                 let chunkFrames: AVAudioFrameCount = 16384
@@ -319,6 +340,9 @@ final class SubtitleGenerator {
                     }
                 } catch {
                     print("SuperResVideoPlayer: legacy audio read failed: \(error)")
+                    request.endAudio()
+                    readFailureHandler.report(error)
+                    return
                 }
                 request.endAudio()
             }

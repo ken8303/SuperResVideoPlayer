@@ -1,10 +1,10 @@
 #!/bin/bash
 # Runs the SuperResCore unit tests.
 #
-# Uses the classic ("native"/llbuild) build system: Xcode 27's newer
-# "swiftbuild" system codesigns the .xctest bundle and fails on some Macs
-# with "resource fork, Finder information, or similar detritus not allowed".
-# `-Xswiftc -gnone` skips the debug-symbol/dsymutil step some Macs also block.
+# Uses SwiftPM's current default build system. Build products stay outside
+# the iCloud-synced repository, which avoids the extended attributes that
+# previously broke test-bundle signing. `-Xswiftc -gnone` also skips the
+# debug-symbol/dsymutil step some Macs block.
 set -euo pipefail
 cd "$(dirname "$0")"
 # Build artefacts go OUTSIDE the project folder.
@@ -19,4 +19,4 @@ SCRATCH="${TMPDIR:-/tmp}"
 SCRATCH="${SCRATCH%/}/SuperResVideoPlayer-build"   # TMPDIR ends in "/" on macOS
 mkdir -p "$SCRATCH"
 
-swift test --build-system native --scratch-path "$SCRATCH" -Xswiftc -gnone
+swift test --scratch-path "$SCRATCH" -Xswiftc -gnone

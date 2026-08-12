@@ -50,20 +50,97 @@ REPO="$PWD"
 # allowed", and clearing the attributes is a race you can't win. /tmp isn't
 # managed by the file provider, so the bundle stays clean.
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/SuperResVideoPlayerDist.XXXXXX")"
-trap 'rm -rf "$STAGE"' EXIT
+DIST_NEXT="$REPO/.dist.new.$$"
+DIST_PREVIOUS="$REPO/.dist.previous.$$"
+cleanup() {
+  rm -rf "$STAGE" "$DIST_NEXT"
+  if [ -d "$DIST_PREVIOUS" ] && [ ! -e "$REPO/$DIST" ]; then
+    mv "$DIST_PREVIOUS" "$REPO/$DIST"
+  fi
+}
+trap cleanup EXIT
 APP="$STAGE/SuperResVideoPlayer.app"
 FRAMEWORKS="$APP/Contents/Frameworks"
 HELPERS="$APP/Contents/Helpers"
+LICENSES="$APP/Contents/Resources/Licenses"
+HOMEBREW_LICENSES="$LICENSES/Homebrew"
+FORMULA_MANIFEST="$LICENSES/Homebrew-Formulae.tsv"
 
-rm -rf "$DIST"
-mkdir -p "$DIST"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$FRAMEWORKS" "$HELPERS"
+rm -rf "$DIST_NEXT" "$DIST_PREVIOUS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$FRAMEWORKS" "$HELPERS" "$LICENSES"
 
 cp "$BIN" "$APP/Contents/MacOS/SuperResVideoPlayer"
 cp Info.plist "$APP/Contents/Info.plist"
 if [ -d "$BUNDLE_SRC" ]; then
   cp -R "$BUNDLE_SRC" "$APP/Contents/Resources/"
 fi
+
+# --- Third-party notices ----------------------------------------------
+# Binary distributions include GPL-enabled Homebrew builds. Ship the exact
+# license texts installed with the two primary projects and a source notice.
+guarded_copy_license() {
+  local source="$1"
+  local destination="$2"
+  if [ ! -f "$source" ]; then
+    echo "error: required third-party license missing: $source"
+    exit 1
+  fi
+  cp "$source" "$destination"
+}
+
+# Record the exact installed formula, declared SPDX license, upstream source,
+# and any license/notice files Homebrew installed at the formula root. This is
+# also called while walking dylib dependencies, so transitive libraries are
+# documented instead of only mpv and FFmpeg themselves.
+record_formula_notice() {
+  local formula="$1"
+  local prefix version destination metadata license homepage source checksum file
+  prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+  [ -d "$prefix" ] || return 0
+  prefix="$(cd "$prefix" && pwd -P)"
+  version="$(basename "$prefix")"
+  destination="$HOMEBREW_LICENSES/$formula-$version"
+  [ ! -d "$destination" ] || return 0
+  mkdir -p "$destination"
+
+  metadata="$(brew info --json=v2 "$formula")"
+  license="$(printf '%s' "$metadata" | jq -r '.formulae[0].license // "unspecified"')"
+  homepage="$(printf '%s' "$metadata" | jq -r '.formulae[0].homepage // ""')"
+  source="$(printf '%s' "$metadata" | jq -r '.formulae[0].urls.stable.url // ""')"
+  checksum="$(printf '%s' "$metadata" | jq -r '.formulae[0].urls.stable.checksum // ""')"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$formula" "$version" "$license" "$homepage" "$source" "$checksum" >> "$FORMULA_MANIFEST"
+
+  while IFS= read -r file; do
+    cp "$file" "$destination/$(basename "$file")"
+  done < <(find "$prefix" -maxdepth 1 -type f \( \
+    -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \
+    -o -iname 'COPYRIGHT*' \) -print)
+}
+
+if [ ! -f THIRD_PARTY_NOTICES.md ]; then
+  echo "error: THIRD_PARTY_NOTICES.md is required for binary distribution"
+  exit 1
+fi
+if [ ! -f LICENSE ]; then
+  echo "error: LICENSE is required for binary distribution"
+  exit 1
+fi
+cp LICENSE "$APP/Contents/Resources/SuperResVideoPlayer License.txt"
+cp THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/Third-Party Notices.md"
+mkdir -p "$HOMEBREW_LICENSES"
+printf 'formula\tinstalled-version\tdeclared-license\thomepage\tsource-url\tsource-sha256\n' > "$FORMULA_MANIFEST"
+
+MPV_PREFIX="$(brew --prefix mpv)"
+FFMPEG_PREFIX="$(brew --prefix ffmpeg)"
+record_formula_notice mpv
+record_formula_notice ffmpeg
+guarded_copy_license "$MPV_PREFIX/LICENSE.GPL" "$LICENSES/mpv-GPL.txt"
+guarded_copy_license "$MPV_PREFIX/LICENSE.LGPL" "$LICENSES/mpv-LGPL.txt"
+guarded_copy_license "$FFMPEG_PREFIX/LICENSE.md" "$LICENSES/FFmpeg-LICENSE.md"
+for license in COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3; do
+  guarded_copy_license "$FFMPEG_PREFIX/$license" "$LICENSES/FFmpeg-$license.txt"
+done
 
 # --- App icon ----------------------------------------------------------
 # Build AppIcon.icns from the 1024px master (no Xcode asset catalog needed).
@@ -107,9 +184,21 @@ is_bundleable() {
 # Contents/Frameworks (by basename; the tree is a DAG so this terminates).
 collect_deps() {
   local target="$1"
-  local dep name
+  local dep name cellar_path formula
   for dep in $(otool -L "$target" | tail -n +2 | awk '{print $1}'); do
     is_bundleable "$dep" || continue
+    case "$dep" in
+      /opt/homebrew/Cellar/*)
+        cellar_path="${dep#/opt/homebrew/Cellar/}"
+        formula="${cellar_path%%/*}"
+        record_formula_notice "$formula"
+        ;;
+      /opt/homebrew/opt/*)
+        cellar_path="${dep#/opt/homebrew/opt/}"
+        formula="${cellar_path%%/*}"
+        record_formula_notice "$formula"
+        ;;
+    esac
     name="$(basename "$dep")"
     if [ ! -f "$FRAMEWORKS/$name" ]; then
       if [ ! -f "$dep" ]; then
@@ -177,9 +266,9 @@ find "$APP" -name '.DS_Store' -delete 2>/dev/null || true
 dot_clean -m "$APP" 2>/dev/null || true
 xattr -cr "$APP" 2>/dev/null || true
 
-if ! codesign --force --sign - "$APP" 2>/tmp/codesign.err; then
+if ! codesign --force --sign - "$APP" 2>"$STAGE/codesign.err"; then
   echo "error: codesign failed:"
-  cat /tmp/codesign.err
+  cat "$STAGE/codesign.err"
   echo
   echo "Remaining extended attributes (these are the likely culprit):"
   xattr -lr "$APP" | head -40
@@ -205,15 +294,24 @@ fi
 echo "    no Homebrew references — bundle is self-contained"
 
 # Zip from the clean staging area (so the archive carries no file-provider
-# metadata), then copy the results back into the repo's dist/ folder.
+# metadata), then assemble the next dist directory beside the current one.
+# Only swap it into place after every copy succeeds, preserving a previously
+# working release if any earlier build/sign/verification step fails.
 echo "==> Zipping…"
-ditto -c -k --keepParent --sequesterRsrc "$APP" "$STAGE/SuperResVideoPlayer.zip"
+ditto -c -k --keepParent --norsrc "$APP" "$STAGE/SuperResVideoPlayer.zip"
 
-cp "$STAGE/SuperResVideoPlayer.zip" "$DIST/"
+mkdir -p "$DIST_NEXT"
+cp "$STAGE/SuperResVideoPlayer.zip" "$DIST_NEXT/"
 # A copy of the signed app for local testing. (Copying it back into an
 # iCloud-synced folder may re-attach xattrs; that's harmless for running it,
 # and the zip above is the artifact you actually distribute.)
-ditto "$APP" "$DIST/SuperResVideoPlayer.app"
+ditto "$APP" "$DIST_NEXT/SuperResVideoPlayer.app"
+
+if [ -e "$DIST" ]; then
+  mv "$DIST" "$DIST_PREVIOUS"
+fi
+mv "$DIST_NEXT" "$DIST"
+rm -rf "$DIST_PREVIOUS"
 
 echo ""
 echo "Done:"

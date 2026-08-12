@@ -15,10 +15,8 @@
 	-->
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>SuperResVideoPlayer uses on-device speech recognition to generate subtitles from the audio of videos you open. Nothing is uploaded unless your Mac falls back to Apple's server-based recognition for a language that doesn't support on-device transcription.</string>
-	<!-- TODO: replace with your own reverse-DNS identifier before signing/
-	     notarizing or distributing this app to anyone else. -->
 	<key>CFBundleIdentifier</key>
-	<string>com.example.SuperResVideoPlayer</string>
+	<string>io.github.ken8303.SuperResVideoPlayer</string>
 	<key>CFBundleName</key>
 	<string>SuperResVideoPlayer</string>
 	<key>CFBundleDisplayName</key>
@@ -38,9 +36,9 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Bundles mpv/libmpv and FFmpeg (LGPL/GPL). See the project README for license details.</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2</string>
+	<string>1.3</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<!-- Lets Finder offer this app under "Open With" for video files, and

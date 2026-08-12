@@ -10,10 +10,9 @@ cd "$(dirname "$0")"
 
 VENV=.model-venv
 WEIGHTS_URL="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth"
-# Expected SHA-256 of realesr-animevideov3.pth. Leave empty to trust-on-
-# first-use (the script prints the hash it downloaded); paste that value
-# here to enforce integrity on future runs.
-WEIGHTS_SHA256=""
+# Expected SHA-256 of the upstream realesr-animevideov3.pth release asset.
+# Refuse to convert a corrupted or substituted download.
+WEIGHTS_SHA256="b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d"
 DEST="$HOME/Library/Application Support/SuperResVideoPlayer"
 
 echo "==> Setting up Python environment (first run only)…"

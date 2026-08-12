@@ -148,8 +148,8 @@ libmpv (demux + decode + audio + A/V sync)
   ghosting around fast/complex motion, especially at 3x. During playback,
   interpolation only engages when Vision keeps up in real time — the stats
   line shows the live synth rate; export always interpolates every pair.
-- Export ignores rotation metadata and doesn't tag HDR color primaries —
-  fine for typical SDR files, wrong for rotated phone footage or HDR.
+- Export currently uses an 8-bit SDR working format. HDR export is blocked
+  with a clear message until a color-managed tone-mapping path is available.
 - The cue-grouping heuristic is pause/length-based, not linguistic; breaks
   won't always land on natural phrase boundaries.
 - Subtitle translation quality is "on-device LLM" grade — good for
@@ -192,10 +192,16 @@ Sources/SuperResVideoPlayer/
 
 ## Licenses
 
-The source in this repository is the author's. Binary distributions built
-with `make-dist.sh` bundle [mpv/libmpv](https://mpv.io) and
+SuperResVideoPlayer is free and open-source software licensed under the
+[GNU General Public License v3.0 or later](LICENSE). You may use, study,
+modify, and redistribute it under those terms.
+
+Binary distributions built with `make-dist.sh` bundle [mpv/libmpv](https://mpv.io) and
 [FFmpeg](https://ffmpeg.org) (Homebrew builds, GPL-enabled) — if you
 redistribute the bundled app, GPL obligations apply to those components.
+The package includes their primary license texts and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). A public binary release
+must also provide matching corresponding source.
 
 The **Max** engine uses the [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
 `realesr-animevideov3` model (BSD-3-Clause, Xintao Wang et al.). The model

@@ -43,10 +43,16 @@ public enum SubtitleGrouping {
         var cues: [SubtitleCue] = []
         var currentWords: [WordTiming] = []
 
-        func flush() {
+        func flush(before nextStart: TimeInterval? = nil) {
             guard let first = currentWords.first, let last = currentWords.last else { return }
             let text = currentWords.map(\.text).joined(separator: separator)
-            cues.append(SubtitleCue(startTime: first.start, endTime: last.end + trailingPadding, text: text))
+            let paddedEnd = last.end + trailingPadding
+            // A length/duration split can happen even when the next word
+            // starts almost immediately. Do not let display padding overlap
+            // that next cue, because the overlay resolves overlaps by taking
+            // the first matching cue.
+            let end = nextStart.map { max(first.start, min(paddedEnd, $0)) } ?? paddedEnd
+            cues.append(SubtitleCue(startTime: first.start, endTime: end, text: text))
             currentWords.removeAll()
         }
 
@@ -58,7 +64,7 @@ public enum SubtitleGrouping {
                 let projectedDuration = word.end - first.start
 
                 if gap > pauseThreshold || projectedChars > maxCueChars || projectedDuration > maxCueDuration {
-                    flush()
+                    flush(before: word.start)
                 }
             }
             currentWords.append(word)

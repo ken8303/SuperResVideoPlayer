@@ -52,4 +52,17 @@ final class SubtitleGroupingTests: XCTestCase {
         let cues = SubtitleGrouping.buildCues(from: words, joiningWith: " ")
         XCTAssertEqual(cues.count, 2)
     }
+
+    func testLengthSplitDoesNotOverlapNextCue() {
+        let words = [
+            WordTiming(text: String(repeating: "a", count: 50), start: 0, end: 1),
+            WordTiming(text: String(repeating: "b", count: 50), start: 1.05, end: 2)
+        ]
+
+        let cues = SubtitleGrouping.buildCues(from: words, joiningWith: " ")
+
+        XCTAssertEqual(cues.count, 2)
+        XCTAssertLessThanOrEqual(cues[0].endTime, cues[1].startTime)
+        XCTAssertEqual(cues[0].endTime, 1.05, accuracy: 0.0001)
+    }
 }

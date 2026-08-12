@@ -8,6 +8,7 @@ import SuperResCore
 
 enum VideoExportError: LocalizedError {
     case cancelled
+    case unsupportedSource(String)
     case unreadableSource(String)
     case writerSetupFailed(String)
     case processingFailed(String)
@@ -16,6 +17,8 @@ enum VideoExportError: LocalizedError {
         switch self {
         case .cancelled:
             return "Export was cancelled."
+        case .unsupportedSource(let why):
+            return "This video can't be exported yet: \(why)"
         case .unreadableSource(let why):
             return "Couldn't read the source video: \(why)"
         case .writerSetupFailed(let why):
@@ -29,7 +32,7 @@ enum VideoExportError: LocalizedError {
 /// Offline export: decodes the source video and re-applies the same
 /// enhancement pipeline the player runs in real time — MetalFX Super
 /// Resolution and/or AI frame interpolation — then encodes HEVC .mp4 with
-/// the audio passed through.
+/// the audio re-encoded to AAC.
 ///
 /// Architecture note: the writer drives everything. AVAssetWriter's
 /// `requestMediaDataWhenReady` callback is the only reliable way to feed a
@@ -94,6 +97,7 @@ final class VideoExporter: @unchecked Sendable {
         let sourceFPS: Double
         let audioChannels: Int
         let audioSampleRate: Double
+        let preferredTransform: CGAffineTransform
     }
 
     func export(
@@ -118,6 +122,17 @@ final class VideoExporter: @unchecked Sendable {
             : audioTracks[min(max(0, configuration.audioTrackIndex), audioTracks.count - 1)]
         let duration = try await asset.load(.duration).seconds
         let nominalFPS = try await videoTrack.load(.nominalFrameRate)
+        let preferredTransform = try await videoTrack.load(.preferredTransform)
+        let videoFormats = try await videoTrack.load(.formatDescriptions)
+        let transferFunction = videoFormats.lazy.compactMap { format -> String? in
+            guard let rawExtensions = CMFormatDescriptionGetExtensions(format) else { return nil }
+            let extensions = rawExtensions as NSDictionary
+            return extensions[kCMFormatDescriptionExtension_TransferFunction] as? String
+        }.first
+        guard !VideoMath.isHDRTransferFunction(transferFunction) else {
+            throw VideoExportError.unsupportedSource(
+                "HDR export needs color-managed tone mapping; playback is unaffected.")
+        }
 
         var audioChannels = 2
         var audioSampleRate = 48000.0
@@ -137,7 +152,8 @@ final class VideoExporter: @unchecked Sendable {
             durationSeconds: duration,
             sourceFPS: Double(nominalFPS > 0 ? nominalFPS : 30),
             audioChannels: audioChannels,
-            audioSampleRate: audioSampleRate
+            audioSampleRate: audioSampleRate,
+            preferredTransform: preferredTransform
         )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -259,9 +275,17 @@ final class VideoExporter: @unchecked Sendable {
 
         var outWidth = inputWidth
         var outHeight = inputHeight
-        if configuration.superResolutionEnabled {
-            let wantWidth = max(inputWidth, Int(Double(inputWidth) * configuration.upscaleFactor))
-            let wantHeight = max(inputHeight, Int(Double(inputHeight) * configuration.upscaleFactor))
+        superResolutionSetup: if configuration.superResolutionEnabled {
+            let outputSize = VideoMath.upscaledDimensions(
+                inputWidth: inputWidth,
+                inputHeight: inputHeight,
+                requestedFactor: configuration.upscaleFactor)
+            let wantWidth = outputSize.width
+            let wantHeight = outputSize.height
+            guard wantWidth > inputWidth || wantHeight > inputHeight else {
+                // The source is already at Metal's texture limit.
+                break superResolutionSetup
+            }
             let descriptor = MTLFXSpatialScalerDescriptor()
             descriptor.inputWidth = inputWidth
             descriptor.inputHeight = inputHeight
@@ -300,6 +324,15 @@ final class VideoExporter: @unchecked Sendable {
                 AVVideoExpectedSourceFrameRateKey: Int(outputFPS.rounded())
             ]
         ])
+        // Preserve portrait/rotation metadata. When Super Resolution changes
+        // the encoded dimensions, the transform's translation components
+        // must be scaled to the new coordinate space as well.
+        videoInput.transform = VideoMath.scaledTrackTransform(
+            info.preferredTransform,
+            inputWidth: inputWidth,
+            inputHeight: inputHeight,
+            outputWidth: outWidth,
+            outputHeight: outHeight)
         videoInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoInput) else {
             throw VideoExportError.writerSetupFailed("Video settings rejected.")
@@ -643,11 +676,14 @@ final class VideoExporter: @unchecked Sendable {
         // Wait for both providers. `fail()` unblocks both exactly once, and
         // a writer failure also breaks the loops.
         while videoDone.wait(timeout: .now() + 0.25) == .timedOut {
-            if cancelledNow { reader.cancelReading() }
+            // Cancelling only the reader is insufficient while AVAssetWriter
+            // is applying backpressure: it may never invoke either provider
+            // again, leaving these semaphores unsignalled forever.
+            if cancelledNow { fail(VideoExportError.cancelled) }
             if writer.status == .failed { fail(writer.error ?? VideoExportError.processingFailed("Writer failed.")) }
         }
         while audioDone.wait(timeout: .now() + 0.25) == .timedOut {
-            if cancelledNow { reader.cancelReading() }
+            if cancelledNow { fail(VideoExportError.cancelled) }
             if writer.status == .failed { fail(writer.error ?? VideoExportError.processingFailed("Writer failed.")) }
         }
 
@@ -664,7 +700,14 @@ final class VideoExporter: @unchecked Sendable {
 
         let finishSemaphore = DispatchSemaphore(value: 0)
         writer.finishWriting { finishSemaphore.signal() }
-        finishSemaphore.wait()
+        // Finalization can still take time after all samples are appended.
+        // Keep the Cancel button effective during that phase too.
+        while finishSemaphore.wait(timeout: .now() + 0.25) == .timedOut {
+            if cancelledNow {
+                writer.cancelWriting()
+                throw VideoExportError.cancelled
+            }
+        }
         guard writer.status == .completed else {
             throw VideoExportError.processingFailed(writer.error?.localizedDescription ?? "Finalizing failed.")
         }

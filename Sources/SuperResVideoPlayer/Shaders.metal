@@ -36,6 +36,21 @@ fragment float4 videoFragmentShader(VertexOut in [[stage_in]],
 
 // MARK: - AI Image Enhancer
 
+/// Copies a source window into the fixed-size Core ML tile. Coordinates
+/// outside a small source frame clamp to its final row/column, preventing
+/// uninitialised pixels from a previous tile from reaching the model.
+kernel void stageTileKernel(texture2d<float, access::read> src [[texture(0)]],
+                            texture2d<float, access::write> dst [[texture(1)]],
+                            constant uint2 &sourceOrigin [[buffer(0)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
+        return;
+    }
+    uint2 sourceMax = uint2(src.get_width() - 1, src.get_height() - 1);
+    uint2 sourcePosition = min(sourceOrigin + gid, sourceMax);
+    dst.write(src.read(sourcePosition), gid);
+}
+
 struct EnhanceParams {
     float sharpness;   // 0..1
     float denoise;     // 0..1

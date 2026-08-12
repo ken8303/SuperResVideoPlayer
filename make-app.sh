@@ -58,6 +58,13 @@ codesign --force --sign - "$APP"
 
 echo "Built $APP"
 
+# The project-local development launcher uses this mode to build and stage
+# the real app bundle before choosing how to launch it (normal, debugger,
+# logs, or process verification).
+if [ "${SRV_BUILD_ONLY:-0}" = "1" ]; then
+  exit 0
+fi
+
 # Launch the binary inside the bundle directly (instead of `open`) so
 # stdout/stderr still print to this terminal. Bundle identity is derived
 # from the executable's location, so this still counts as a real app.

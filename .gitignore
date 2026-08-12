@@ -17,3 +17,6 @@ DerivedData/
 *.mlpackage
 *.mlmodelc
 index.html
+
+# Local media-library survey output (may contain private absolute paths)
+/report*.csv

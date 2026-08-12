@@ -1,7 +1,41 @@
 import XCTest
+import CoreGraphics
 @testable import SuperResCore
 
 final class VideoMathTests: XCTestCase {
+
+    func testHDRPassthroughRequiresHDRHighBitDepthAndDisplayHeadroom() {
+        XCTAssertTrue(VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true, usingHighBitDepth: true, displayHeadroom: 1.5))
+        XCTAssertFalse(VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: false, usingHighBitDepth: true, displayHeadroom: 1.5))
+        XCTAssertFalse(VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true, usingHighBitDepth: false, displayHeadroom: 1.5))
+        XCTAssertFalse(VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true, usingHighBitDepth: true, displayHeadroom: 1.0))
+    }
+
+    func testHDRPassthroughRejectsInvalidOrRoundingOnlyHeadroom() {
+        XCTAssertFalse(VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true, usingHighBitDepth: true, displayHeadroom: 1.05))
+        XCTAssertFalse(VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true, usingHighBitDepth: true, displayHeadroom: .nan))
+        XCTAssertFalse(VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true, usingHighBitDepth: true, displayHeadroom: .infinity))
+    }
+
+    func testRecognizesHDRTransferFunctionSpellings() {
+        for value in ["pq", "smpte2084", "SMPTE_ST_2084_PQ", "hlg",
+                      "arib-std-b67", "ITU_R_2100_HLG"] {
+            XCTAssertTrue(VideoMath.isHDRTransferFunction(value), value)
+        }
+    }
+
+    func testRejectsSDRAndMissingTransferFunctions() {
+        for value in [nil, "", "bt709", "ITU_R_709_2", "sRGB"] as [String?] {
+            XCTAssertFalse(VideoMath.isHDRTransferFunction(value), value ?? "nil")
+        }
+    }
 
     // MARK: Pixel-format bit depth
     //
@@ -82,5 +116,69 @@ final class VideoMathTests: XCTestCase {
 
     func testUpscaleFactorHandlesZeroSizeSafely() {
         XCTAssertEqual(VideoMath.clampedUpscaleFactor(inputWidth: 0, inputHeight: 0, requestedFactor: 1.5), 1.5)
+    }
+
+    func testUpscaledDimensionsClampAtMetalLimit() {
+        let size = VideoMath.upscaledDimensions(
+            inputWidth: 10_000, inputHeight: 4_000, requestedFactor: 2)
+        XCTAssertEqual(size.width, 16_384)
+        XCTAssertEqual(size.height, 6_552)
+    }
+
+    func testUpscaledDimensionsAlignForVideoEncoder() {
+        let size = VideoMath.upscaledDimensions(
+            inputWidth: 1_919, inputHeight: 1_079, requestedFactor: 1.5)
+        XCTAssertEqual(size.width, 2_878)
+        XCTAssertEqual(size.height, 1_618)
+        XCTAssertEqual(size.width % 2, 0)
+        XCTAssertEqual(size.height % 2, 0)
+    }
+
+    func testUpscaledDimensionsRejectInvalidRequest() {
+        XCTAssertEqual(
+            VideoMath.upscaledDimensions(
+                inputWidth: 1920, inputHeight: 1080, requestedFactor: .infinity).width,
+            1920)
+        XCTAssertEqual(
+            VideoMath.upscaledDimensions(
+                inputWidth: 1920, inputHeight: 1080, requestedFactor: 1).height,
+            1080)
+    }
+
+    // MARK: Track transforms
+
+    func testScaledTrackTransformPreservesIdentity() {
+        let result = VideoMath.scaledTrackTransform(
+            .identity,
+            inputWidth: 1920, inputHeight: 1080,
+            outputWidth: 3840, outputHeight: 2160)
+        XCTAssertEqual(result, .identity)
+    }
+
+    func testScaledTrackTransformPreservesPortraitRotationAtTwoX() {
+        let portrait = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 1080, ty: 0)
+        let result = VideoMath.scaledTrackTransform(
+            portrait,
+            inputWidth: 1920, inputHeight: 1080,
+            outputWidth: 3840, outputHeight: 2160)
+        XCTAssertEqual(result.a, 0, accuracy: 0.0001)
+        XCTAssertEqual(result.b, 1, accuracy: 0.0001)
+        XCTAssertEqual(result.c, -1, accuracy: 0.0001)
+        XCTAssertEqual(result.d, 0, accuracy: 0.0001)
+        XCTAssertEqual(result.tx, 2160, accuracy: 0.0001)
+        XCTAssertEqual(result.ty, 0, accuracy: 0.0001)
+    }
+
+    func testScaledTrackTransformHandlesNonUniformRounding() {
+        let portrait = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 1080, ty: 0)
+        let result = VideoMath.scaledTrackTransform(
+            portrait,
+            inputWidth: 1920, inputHeight: 1080,
+            outputWidth: 2880, outputHeight: 1619)
+        let scaleX = CGFloat(2880) / 1920
+        let scaleY = CGFloat(1619) / 1080
+        XCTAssertEqual(result.b, scaleY / scaleX, accuracy: 0.0001)
+        XCTAssertEqual(result.c, -scaleX / scaleY, accuracy: 0.0001)
+        XCTAssertEqual(result.tx, 1080 * scaleX, accuracy: 0.0001)
     }
 }

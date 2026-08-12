@@ -33,6 +33,7 @@ final class NeuralEnhancer {
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
+    private let stageTilePipeline: MTLComputePipelineState
     private let downsamplePipeline: MTLComputePipelineState
     private let model: MLModel
     private let inputName: String
@@ -54,12 +55,15 @@ final class NeuralEnhancer {
             throw VideoExportError.processingFailed("Couldn't create a Metal queue for the Max engine.")
         }
         let library = Renderer.loadShaderLibrary(device: device)
-        guard let downsampleFn = library.makeFunction(name: "downsampleKernel"),
+        guard let stageTileFn = library.makeFunction(name: "stageTileKernel"),
+              let downsampleFn = library.makeFunction(name: "downsampleKernel"),
+              let stageTile = try? device.makeComputePipelineState(function: stageTileFn),
               let downsample = try? device.makeComputePipelineState(function: downsampleFn) else {
-            throw VideoExportError.processingFailed("Couldn't build the downsample pipeline for the Max engine.")
+            throw VideoExportError.processingFailed("Couldn't build the Metal pipelines for the Max engine.")
         }
         self.device = device
         self.commandQueue = queue
+        self.stageTilePipeline = stageTile
         self.downsamplePipeline = downsample
 
         // Compile (fast for this ~2 MB model) and load, preferring the ANE.
@@ -128,20 +132,26 @@ final class NeuralEnhancer {
                 // Source window: 512px, shifted so it stays inside the frame.
                 let srcX = max(0, min(tileX - overlap, width - tileSize))
                 let srcY = max(0, min(tileY - overlap, height - tileSize))
-                let copyWidth = min(tileSize, width)
-                let copyHeight = min(tileSize, height)
-
-                // 1. Stage the tile.
+                // 1. Stage the tile. The compute kernel clamps samples at
+                // the frame edge, so inputs smaller than 512 px never leave
+                // stale/uninitialised pixels in the fixed-size Core ML input.
                 guard let stageBuffer = commandQueue.makeCommandBuffer(),
-                      let stageBlit = stageBuffer.makeBlitCommandEncoder() else {
-                    throw VideoExportError.processingFailed("Max engine: blit failed.")
+                      let stageEncoder = stageBuffer.makeComputeCommandEncoder() else {
+                    throw VideoExportError.processingFailed("Max engine: tile staging failed.")
                 }
-                stageBlit.copy(from: input, sourceSlice: 0, sourceLevel: 0,
-                               sourceOrigin: MTLOrigin(x: srcX, y: srcY, z: 0),
-                               sourceSize: MTLSize(width: copyWidth, height: copyHeight, depth: 1),
-                               to: tileInputTexture, destinationSlice: 0, destinationLevel: 0,
-                               destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-                stageBlit.endEncoding()
+                stageEncoder.setComputePipelineState(stageTilePipeline)
+                stageEncoder.setTexture(input, index: 0)
+                stageEncoder.setTexture(tileInputTexture, index: 1)
+                var sourceOrigin = SIMD2<UInt32>(UInt32(srcX), UInt32(srcY))
+                stageEncoder.setBytes(&sourceOrigin,
+                                      length: MemoryLayout<SIMD2<UInt32>>.size,
+                                      index: 0)
+                let stageGroup = MTLSize(width: 16, height: 16, depth: 1)
+                let stageGrid = MTLSize(width: (tileSize + 15) / 16,
+                                        height: (tileSize + 15) / 16,
+                                        depth: 1)
+                stageEncoder.dispatchThreadgroups(stageGrid, threadsPerThreadgroup: stageGroup)
+                stageEncoder.endEncoding()
                 stageBuffer.commit()
                 stageBuffer.waitUntilCompleted()
 

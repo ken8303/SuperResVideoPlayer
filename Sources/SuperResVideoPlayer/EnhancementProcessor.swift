@@ -25,6 +25,9 @@ final class EnhancementProcessor {
     /// Pixel format of the textures flowing through this processor. Defaults
     /// to 8-bit for the export path; playback passes its 16-bit format.
     private let pixelFormat: MTLPixelFormat
+    /// MetalFX must interpret PQ/HLG input as HDR; perceptual mode assumes
+    /// SDR-encoded values and visibly compresses highlights.
+    private let hdrInput: Bool
     private let enhancePipeline: MTLComputePipelineState
     private let downsamplePipeline: MTLComputePipelineState
 
@@ -35,7 +38,9 @@ final class EnhancementProcessor {
     private var lastSize: (width: Int, height: Int) = (0, 0)
     private(set) var neuralSupported = true
 
-    init?(device: MTLDevice, library: MTLLibrary, pixelFormat: MTLPixelFormat = .bgra8Unorm) {
+    init?(device: MTLDevice, library: MTLLibrary,
+          pixelFormat: MTLPixelFormat = .bgra8Unorm,
+          hdrInput: Bool = false) {
         guard let enhanceFn = library.makeFunction(name: "enhanceKernel"),
               let downsampleFn = library.makeFunction(name: "downsampleKernel"),
               let enhance = try? device.makeComputePipelineState(function: enhanceFn),
@@ -44,6 +49,7 @@ final class EnhancementProcessor {
         }
         self.device = device
         self.pixelFormat = pixelFormat
+        self.hdrInput = hdrInput
         self.enhancePipeline = enhance
         self.downsamplePipeline = downsample
     }
@@ -84,6 +90,10 @@ final class EnhancementProcessor {
     private func ensureResources(width: Int, height: Int, wantNeural: Bool) {
         if lastSize != (width, height) {
             lastSize = (width, height)
+            // A size-specific failure (for example an oversized 8K frame or
+            // temporary allocation pressure) must not permanently disable
+            // Neural enhancement for later, smaller videos.
+            neuralSupported = true
             casOutput = makeTexture(width: width, height: height, renderTarget: false)
             neuralScaler = nil
             neuralUpscaled = nil
@@ -107,7 +117,7 @@ final class EnhancementProcessor {
             descriptor.outputHeight = height * 2
             descriptor.colorTextureFormat = pixelFormat
             descriptor.outputTextureFormat = pixelFormat
-            descriptor.colorProcessingMode = .perceptual
+            descriptor.colorProcessingMode = hdrInput ? .hdr : .perceptual
             guard let scaler = descriptor.makeSpatialScaler(device: device),
                   let upscaled = makeTexture(width: width * 2, height: height * 2, renderTarget: true),
                   let downscaled = makeTexture(width: width, height: height, renderTarget: false) else {

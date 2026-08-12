@@ -44,7 +44,10 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: isFullScreen ? nil : 720,
-               minHeight: isFullScreen ? nil : 480)
+               // Keep every desktop control visible. When space gets tight,
+               // the flexible video area shrinks to its 360-point minimum;
+               // the settings panel itself is never clipped or scrolled.
+               minHeight: isFullScreen ? nil : 860)
         .navigationTitle(playerViewModel.videoTitle)
         // Opening a video from Finder ("Open With", or dropping it on the
         // Dock icon) delivers the file here — without this the app would
@@ -91,20 +94,9 @@ struct ContentView: View {
                     }
                 }
 
-            if let text = playerViewModel.subtitleText(at: playerViewModel.currentTime) {
-                Text(text)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
-                    // Sit above the controls bar when it's showing.
-                    .padding(.bottom, isFullScreen && controlsVisible ? 140 : 24)
-                    .padding(.horizontal, 40)
-                    .shadow(radius: 2)
-                    .allowsHitTesting(false)
-            }
+            SubtitleOverlayView(
+                viewModel: playerViewModel,
+                bottomPadding: isFullScreen && controlsVisible ? 140 : 24)
         }
         .frame(minWidth: 640, minHeight: 360)
         // Right-click the picture for the full settings menu — the only
@@ -132,6 +124,8 @@ struct ContentView: View {
 
     private var controlsBar: some View {
         controls
+            .frame(maxWidth: .infinity)
+            .fixedSize(horizontal: false, vertical: true)
             .padding()
             .background(.regularMaterial)
             // Keep the bar alive while the pointer is over it — otherwise
@@ -202,54 +196,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            HStack {
-                Button {
-                    playerViewModel.togglePlayPause()
-                } label: {
-                    Image(systemName: playerViewModel.isPlaying ? "pause.fill" : "play.fill")
-                        .frame(width: 24)
-                }
-                .disabled(playerViewModel.duration == 0)
-
-                Slider(
-                    value: Binding(
-                        get: { playerViewModel.currentTime },
-                        set: { playerViewModel.seek(toSeconds: $0) }
-                    ),
-                    in: 0...max(playerViewModel.duration, 0.01),
-                    onEditingChanged: { editing in
-                        playerViewModel.isScrubbing = editing
-                    }
-                )
-                .disabled(playerViewModel.duration == 0)
-
-                Text(timeString(playerViewModel.currentTime) + " / " + timeString(playerViewModel.duration))
-                    .font(.caption)
-                    .monospacedDigit()
-                    .frame(minWidth: 100, alignment: .trailing)
-
-                // Volume (also on ↑/↓ and M via the Playback menu).
-                Button {
-                    playerViewModel.toggleMute()
-                } label: {
-                    Image(systemName: playerViewModel.isMuted || playerViewModel.volume == 0
-                          ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                        .frame(width: 18)
-                }
-                .help("Mute (M)")
-
-                Slider(value: $playerViewModel.volume, in: 0...100)
-                    .frame(width: 80)
-                    .disabled(playerViewModel.isMuted)
-
-                Button {
-                    WindowControl.toggleFullScreen()
-                } label: {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .frame(width: 18)
-                }
-                .help("Full screen (F)")
-            }
+            PlaybackTransportView(viewModel: playerViewModel)
 
             Divider()
 
@@ -334,14 +281,14 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            // HDR sources are always tone-mapped down (the render path is
-            // 8-bit); say so rather than silently changing how it looks.
+            // Say whether HDR is reaching the display or being tone-mapped,
+            // rather than silently changing how the source looks.
             if let notice = playerViewModel.hdrNotice {
                 Label(notice, systemImage: "sun.max")
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .help("mpv's software render API outputs 8 bits per channel, so HDR is converted to SDR before the Metal pipeline sees it. Tone-mapping uses the BT.2390 curve with per-scene peak detection.")
+                    .help("HDR uses the 16-bit playback pipeline when supported. On displays without extended range—or if libmpv falls back to 8-bit—the source is tone-mapped with BT.2390 and per-scene peak detection.")
             }
 
             // Audio-track / embedded-subtitle pickers appear only when the
@@ -491,16 +438,6 @@ struct ContentView: View {
         return installed ? "\(name) (downloaded)" : name
     }
 
-    private func timeString(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
-        let total = Int(seconds)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        return h > 0
-            ? String(format: "%d:%02d:%02d", h, m, s)
-            : String(format: "%d:%02d", m, s)
-    }
 }
 
 /// Human-readable label for an audio/subtitle track: title and/or language,
@@ -523,11 +460,11 @@ func videoTrackLabel(for track: MPVPlayer.Track) -> String {
 /// checkmarked items.
 ///
 /// IMPORTANT: this view must not observe `PlayerViewModel` directly.
-/// `currentTime` publishes several times a second during playback, and every
-/// publish would rebuild the open NSMenu — making it flash and impossible to
-/// interact with. Instead it observes `viewModel.menuState`, which fires
-/// only when a value these menus actually display changes; the view model is
-/// held as a plain reference and all bindings are built by hand.
+/// Unrelated state such as pipeline statistics changes during playback, and
+/// every publish would rebuild the open NSMenu — making it flash and
+/// difficult to interact with. Instead it observes `viewModel.menuState`,
+/// which fires only when a value these menus actually display changes; the
+/// view model is held as a plain reference and all bindings are built by hand.
 struct SettingsMenuContent: View {
     let viewModel: PlayerViewModel
     @ObservedObject private var menuState: PlayerViewModel.MenuState

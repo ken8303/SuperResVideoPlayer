@@ -44,9 +44,7 @@ final class MPVPlayer {
 
     /// Color characteristics of the decoded video, read from mpv's
     /// `video-params`. Used to tell the user when an HDR source is being
-    /// tone-mapped down to SDR — which this player always does, because
-    /// mpv's *software* render API can only output 8 bits per channel
-    /// (see the note in `createRenderContext`).
+    /// passed through to an HDR display or tone-mapped down to SDR.
     struct ColorInfo: Equatable {
         /// Transfer function, from `video-params/gamma`. mpv's current names
         /// are "pq" (HDR10/Dolby Vision) and "hlg" (broadcast HDR); SDR is
@@ -58,20 +56,14 @@ final class MPVPlayer {
         /// (SDR reference white is ~100 cd/m²; HDR10 typically tags
         /// 1000–4000.)
         let maxLuminance: Double
-        /// Bit depth of the *decoded* video, before our 8-bit render path.
+        /// Bit depth of the decoded source video.
         let bitDepth: Int
 
         /// The transfer function is the reliable signal; a luminance tag well
         /// above SDR reference white is a secondary one for files that are
         /// HDR but carry an unrecognized gamma name.
         var isHDR: Bool {
-            if let gamma {
-                // Current mpv uses "pq"/"hlg"; the older spellings are kept
-                // so this still works against pre-0.38 builds.
-                let known = ["pq", "hlg", "st2084", "smpte-st2084", "arib-std-b67"]
-                if known.contains(gamma.lowercased()) { return true }
-            }
-            return maxLuminance > 200
+            VideoMath.isHDRTransferFunction(gamma) || maxLuminance > 200
         }
 
         /// Short human-readable summary for the UI.
@@ -134,6 +126,10 @@ final class MPVPlayer {
     private var frameSerial: UInt64 = 0
     private var shuttingDown = false
     private var _pendingTimePos: Double?
+    /// Latest value delivered by mpv's observed `time-pos` property. The
+    /// renderer reads this at up to 120 Hz; caching it avoids making a
+    /// synchronous libmpv property call on every display refresh.
+    private var _playbackTime: Double = 0
 
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolSize: (width: Int, height: Int) = (0, 0)
@@ -218,17 +214,11 @@ final class MPVPlayer {
         mpv_set_option_string(handle, "sub-codepage", "auto")
 
         // --- HDR handling -------------------------------------------------
-        // HDR sources are tone-mapped to SDR, and that is a hard constraint
-        // of this architecture rather than a choice: mpv's *software* render API
-        // (which we use so each frame arrives as a CPU-visible buffer we can
-        // wrap as a Metal texture for MetalFX) only outputs 8 bits per
-        // channel — its documented formats are "rgb0"/"bgr0"/"0bgr"/"0rgb",
-        // all 4x8-bit, and libmpv's own header warns that "HDR may not work
-        // properly" on this path.
-        //
-        // Given that, make the tone-map deliberate rather than default:
-        // BT.2390 is the ITU-recommended curve and preserves highlight detail
-        // noticeably better than a naive clip.
+        // Start with a deliberate SDR fallback. Once a source is identified
+        // as HDR, PlayerViewModel enables PQ passthrough only when libmpv's
+        // 16-bit software output and the attached display both support it.
+        // Otherwise BT.2390 preserves highlight detail better than a naive
+        // clip.
         mpv_set_option_string(handle, "tone-mapping", "bt.2390")
         // Measure each scene's actual peak instead of trusting static
         // metadata, which is frequently wrong or absent.
@@ -308,7 +298,15 @@ final class MPVPlayer {
         // wedged thread rather than an expected path.
         eventControl.stop()
         if eventThreadStarted {
-            _ = eventThreadFinished.wait(timeout: .now() + 2)
+            if eventThreadFinished.wait(timeout: .now() + 2) == .timedOut {
+                // The handle is still potentially in use. Destroying it here
+                // would recreate the shutdown race this ordering prevents.
+                print("SuperResVideoPlayer: mpv event thread did not stop within 2s; deferring handle cleanup.")
+                let cleanup = DeferredHandleCleanup(
+                    handle: handle, finished: eventThreadFinished)
+                DispatchQueue.global(qos: .utility).async { cleanup.run() }
+                return
+            }
         }
         // Sole owner now — safe to destroy.
         mpv_terminate_destroy(handle)
@@ -363,6 +361,24 @@ final class MPVPlayer {
     private let eventThreadFinished = DispatchSemaphore(value: 0)
     private var eventThreadStarted = false
 
+    /// Owns a raw mpv handle after the player itself has gone away. Used only
+    /// when the event thread misses its shutdown deadline: destruction is
+    /// deferred until that thread truly exits instead of racing it.
+    private final class DeferredHandleCleanup: @unchecked Sendable {
+        let handle: OpaquePointer
+        let finished: DispatchSemaphore
+
+        init(handle: OpaquePointer, finished: DispatchSemaphore) {
+            self.handle = handle
+            self.finished = finished
+        }
+
+        func run() {
+            finished.wait()
+            mpv_terminate_destroy(handle)
+        }
+    }
+
     private func startEventThread() {
         guard let handle else { return }
         eventThreadStarted = true
@@ -408,6 +424,7 @@ final class MPVPlayer {
                     stateLock.lock()
                     let alreadyScheduled = _pendingTimePos != nil
                     _pendingTimePos = seconds
+                    _playbackTime = seconds
                     stateLock.unlock()
                     if !alreadyScheduled {
                         DispatchQueue.main.async { [weak self] in
@@ -470,6 +487,8 @@ final class MPVPlayer {
         // screen while the new file spins up.
         stateLock.lock()
         _latestFrame = nil
+        _pendingTimePos = nil
+        _playbackTime = 0
         stateLock.unlock()
 
         command(["loadfile", url.path, "replace"])
@@ -483,6 +502,9 @@ final class MPVPlayer {
     }
 
     func seek(to seconds: Double) {
+        stateLock.lock()
+        _playbackTime = seconds
+        stateLock.unlock()
         command(["seek", String(seconds), "absolute+exact"])
     }
 
@@ -650,9 +672,12 @@ final class MPVPlayer {
     }
 
     /// Current playback position in seconds. Thread-safe; used by the
-    /// renderer every draw to compute the interpolation phase.
+    /// renderer every draw to compute the interpolation phase. This is the
+    /// cached observed value, not a synchronous libmpv query on the hot path.
     var playbackTime: Double {
-        getDouble("time-pos") ?? 0
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _playbackTime
     }
 
     // MARK: Frame output

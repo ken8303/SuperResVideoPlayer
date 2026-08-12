@@ -9,11 +9,10 @@ struct SuperResVideoPlayerApp: App {
     ///
     /// Deliberately a plain `static let`, NOT `@StateObject`: observing the
     /// view model here would re-evaluate this App's `body` — and with it the
-    /// whole `.commands` tree — on every `currentTime` publish (several
-    /// times a second during playback). That rebuilds the open menu-bar
-    /// menus continuously, making them flash and swallow clicks. Views that
-    /// genuinely need to re-render on playback state (ContentView) observe
-    /// it themselves; menus observe the narrow `menuState` instead.
+    /// whole `.commands` tree — for unrelated player-state changes. That can
+    /// rebuild open menu-bar menus, making them flash and swallow clicks.
+    /// Views that genuinely need to re-render on playback state observe it
+    /// themselves; menus observe the narrow `menuState` instead.
     /// `static` guarantees a single instance even if SwiftUI re-creates the
     /// App struct.
     private static let sharedViewModel = PlayerViewModel()
@@ -34,6 +33,7 @@ struct SuperResVideoPlayerApp: App {
         WindowGroup {
             ContentView(playerViewModel: playerViewModel)
         }
+        .defaultSize(width: 1100, height: 900)
         .windowResizability(.contentSize)
         .commands {
             PlaybackCommands(viewModel: playerViewModel)
@@ -45,11 +45,10 @@ struct SuperResVideoPlayerApp: App {
 /// Menu-bar commands — these are what register the keyboard shortcuts.
 ///
 /// Observes `menuState` rather than the view model itself, for the same
-/// reason as `SettingsMenuContent`: the view model publishes `currentTime`
-/// several times a second, and any observation at this level rebuilds the
-/// menu-bar menus continuously (flashing, unclickable). `menuState` fires
-/// only on the values these items display — play/pause, mute, whether a
-/// video is loaded, whether an export is running.
+/// reason as `SettingsMenuContent`: broad observation at this level rebuilds
+/// the menu-bar menus for unrelated player changes. `menuState` fires only
+/// on the values these items display — play/pause, mute, whether a video is
+/// loaded, whether an export is running.
 struct PlaybackCommands: Commands {
     let viewModel: PlayerViewModel
     @ObservedObject private var menuState: PlayerViewModel.MenuState

@@ -10,7 +10,7 @@ enum MediaImportError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .ffmpegNotFound:
-            return "Generating subtitles for this container needs its audio extracted first, which requires ffmpeg. Install it with `brew install ffmpeg`, then try again."
+            return "This conversion requires ffmpeg. Install it with `brew install ffmpeg`, then try again."
         case .extractionFailed(let code, let log):
             let tail = log.split(separator: "\n").suffix(2).joined(separator: " ")
             return "Audio extraction failed (ffmpeg exited \(code)). \(tail)"
@@ -28,11 +28,10 @@ enum MediaImportError: LocalizedError {
 /// conversion happens anywhere*. This class exists only because the AI
 /// Subtitle Generator uses Apple's Speech framework, which reads files
 /// through AVFoundation and therefore can't open MKV/WebM/etc. Pulling just
-/// the audio track into a small temporary .m4a (stream-copy when it's
-/// already AAC/ALAC, transcode otherwise) is fast and leaves the video
+/// the audio track into a temporary 16 kHz WAV is fast and leaves the video
 /// untouched. Results are cached keyed on the source's path/size/mtime.
 ///
-/// `@unchecked Sendable`: all mutable state (`runningProcess`) is guarded by
+/// `@unchecked Sendable`: process and cancellation state are guarded by
 /// `processLock`, and work is dispatched onto a serial queue — the safety
 /// the compiler can't verify is enforced manually here.
 final class MediaImporter: @unchecked Sendable {
@@ -76,14 +75,26 @@ final class MediaImporter: @unchecked Sendable {
     private let workQueue = DispatchQueue(label: "SuperResVideoPlayer.MediaImporter", qos: .userInitiated)
     private let processLock = NSLock()
     private var runningProcess: Process?
+    /// Incremented on Cancel even when ffmpeg has not launched yet, closing
+    /// the race where a click landed during probing and therefore had no
+    /// process to terminate. Each operation captures its starting value, so
+    /// later operations are not poisoned by an earlier cancellation.
+    private var cancellationGeneration: UInt64 = 0
 
     /// Terminates any in-flight ffmpeg process. The awaiting `extractAudio`
     /// call then throws `MediaImportError.cancelled`.
     func cancel() {
         processLock.lock()
+        cancellationGeneration &+= 1
         let process = runningProcess
         processLock.unlock()
         process?.terminate()
+    }
+
+    private func currentCancellationGeneration() -> UInt64 {
+        processLock.lock()
+        defer { processLock.unlock() }
+        return cancellationGeneration
     }
 
     /// Extracts one of `url`'s audio tracks to a temporary WAV, reporting
@@ -94,11 +105,13 @@ final class MediaImporter: @unchecked Sendable {
     /// before.
     func extractAudio(from url: URL, audioStreamIndex: Int = 0,
                       onProgress: @escaping (Double) -> Void) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
+        let operationGeneration = currentCancellationGeneration()
+        return try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
                     continuation.resume(returning: try self.extractAudioSync(
-                        url: url, audioStreamIndex: audioStreamIndex, onProgress: onProgress))
+                        url: url, audioStreamIndex: audioStreamIndex,
+                        operationGeneration: operationGeneration, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -108,15 +121,17 @@ final class MediaImporter: @unchecked Sendable {
 
     /// Transcodes to a baseline H.264 8-bit 4:2:0 .mp4 that AVAssetReader
     /// can always decode. Used as an export fallback when the reader can't
-    /// handle the source directly (e.g. 10-bit HEVC). The player's Metal
-    /// pipeline is 8-bit anyway, so no additional precision is lost.
+    /// handle the source directly (e.g. 10-bit HEVC). The export pipeline
+    /// currently consumes BGRA8, so this fallback matches that constraint.
     func transcodeForExport(from url: URL, audioStreamIndex: Int = 0,
                             onProgress: @escaping (Double) -> Void) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
+        let operationGeneration = currentCancellationGeneration()
+        return try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
                     continuation.resume(returning: try self.transcodeForExportSync(
-                        url: url, audioStreamIndex: audioStreamIndex, onProgress: onProgress))
+                        url: url, audioStreamIndex: audioStreamIndex,
+                        operationGeneration: operationGeneration, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -125,6 +140,7 @@ final class MediaImporter: @unchecked Sendable {
     }
 
     private func transcodeForExportSync(url: URL, audioStreamIndex: Int,
+                                        operationGeneration: UInt64,
                                         onProgress: @escaping (Double) -> Void) throws -> URL {
         guard let ffmpeg = Self.findExecutable("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
@@ -148,7 +164,9 @@ final class MediaImporter: @unchecked Sendable {
         ]
         do {
             try runFFmpeg(arguments: args, ffmpegPath: ffmpeg,
-                          durationSeconds: info.duration, onProgress: onProgress)
+                          durationSeconds: info.duration,
+                          operationGeneration: operationGeneration,
+                          onProgress: onProgress)
         } catch {
             try? FileManager.default.removeItem(at: partialURL)
             throw error
@@ -164,11 +182,13 @@ final class MediaImporter: @unchecked Sendable {
     /// unless already MP4-compatible.
     func remuxVideoToMP4(from url: URL, audioStreamIndex: Int = 0,
                          onProgress: @escaping (Double) -> Void) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
+        let operationGeneration = currentCancellationGeneration()
+        return try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
                     continuation.resume(returning: try self.remuxVideoSync(
-                        url: url, audioStreamIndex: audioStreamIndex, onProgress: onProgress))
+                        url: url, audioStreamIndex: audioStreamIndex,
+                        operationGeneration: operationGeneration, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -177,6 +197,7 @@ final class MediaImporter: @unchecked Sendable {
     }
 
     private func remuxVideoSync(url: URL, audioStreamIndex: Int,
+                                operationGeneration: UInt64,
                                 onProgress: @escaping (Double) -> Void) throws -> URL {
         guard let ffmpeg = Self.findExecutable("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
@@ -221,7 +242,8 @@ final class MediaImporter: @unchecked Sendable {
 
         do {
             try runFFmpeg(arguments: arguments(videoCopy: videoCopy, audioCopy: audioCopy),
-                          ffmpegPath: ffmpeg, durationSeconds: info.duration, onProgress: onProgress)
+                          ffmpegPath: ffmpeg, durationSeconds: info.duration,
+                          operationGeneration: operationGeneration, onProgress: onProgress)
         } catch let error as MediaImportError {
             if case .cancelled = error {
                 try? FileManager.default.removeItem(at: partialURL)
@@ -235,7 +257,8 @@ final class MediaImporter: @unchecked Sendable {
             // transcode before giving up.
             try? FileManager.default.removeItem(at: partialURL)
             try runFFmpeg(arguments: arguments(videoCopy: false, audioCopy: false),
-                          ffmpegPath: ffmpeg, durationSeconds: info.duration, onProgress: onProgress)
+                          ffmpegPath: ffmpeg, durationSeconds: info.duration,
+                          operationGeneration: operationGeneration, onProgress: onProgress)
         }
 
         try FileManager.default.moveItem(at: partialURL, to: outputURL)
@@ -243,6 +266,7 @@ final class MediaImporter: @unchecked Sendable {
     }
 
     private func extractAudioSync(url: URL, audioStreamIndex: Int,
+                                  operationGeneration: UInt64,
                                   onProgress: @escaping (Double) -> Void) throws -> URL {
         guard let ffmpeg = Self.findExecutable("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
@@ -285,7 +309,9 @@ final class MediaImporter: @unchecked Sendable {
 
         do {
             try runFFmpeg(arguments: args, ffmpegPath: ffmpeg,
-                          durationSeconds: info.duration, onProgress: onProgress)
+                          durationSeconds: info.duration,
+                          operationGeneration: operationGeneration,
+                          onProgress: onProgress)
         } catch {
             try? FileManager.default.removeItem(at: partialURL)
             // When ffprobe wasn't available to pre-detect it, a video-only
@@ -307,6 +333,7 @@ final class MediaImporter: @unchecked Sendable {
         arguments: [String],
         ffmpegPath: String,
         durationSeconds: Double,
+        operationGeneration: UInt64,
         onProgress: @escaping (Double) -> Void
     ) throws {
         let process = Process()
@@ -341,22 +368,35 @@ final class MediaImporter: @unchecked Sendable {
             }
         }
 
-        processLock.lock()
-        runningProcess = process
-        processLock.unlock()
-
         defer {
-            processLock.lock()
-            runningProcess = nil
-            processLock.unlock()
             stdout.fileHandleForReading.readabilityHandler = nil
             stderr.fileHandleForReading.readabilityHandler = nil
         }
 
-        try process.run()
+        // Hold the lock across launch and publication. `cancel()` therefore
+        // either records cancellation before launch (and we do not start) or
+        // sees the running process immediately afterward and terminates it.
+        processLock.lock()
+        if cancellationGeneration != operationGeneration {
+            processLock.unlock()
+            throw MediaImportError.cancelled
+        }
+        do {
+            try process.run()
+            runningProcess = process
+            processLock.unlock()
+        } catch {
+            processLock.unlock()
+            throw error
+        }
         process.waitUntilExit()
 
-        if process.terminationReason == .uncaughtSignal {
+        processLock.lock()
+        let wasCancelled = cancellationGeneration != operationGeneration
+        runningProcess = nil
+        processLock.unlock()
+
+        if wasCancelled {
             throw MediaImportError.cancelled
         }
         guard process.terminationStatus == 0 else {

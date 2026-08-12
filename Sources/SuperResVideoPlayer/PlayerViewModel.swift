@@ -20,10 +20,9 @@ final class PlayerViewModel: ObservableObject {
 
     /// Refresh channel for the settings menus (video context menu + "Video"
     /// menu-bar menu). Menus must NOT observe the view model itself:
-    /// `currentTime` updates several times a second and `pipelineStatus`
-    /// every second, and rebuilding an open NSMenu that often makes it
-    /// flash and impossible to click. This object fires only when a value
-    /// the menus actually display changes.
+    /// `pipelineStatus` updates every second, and rebuilding an open NSMenu
+    /// that often makes it flash and impossible to click. This object fires
+    /// only when a value the menus actually display changes.
     final class MenuState: ObservableObject {
         fileprivate func changed() { objectWillChange.send() }
     }
@@ -35,7 +34,14 @@ final class PlayerViewModel: ObservableObject {
     @Published var isPlaying = false {
         didSet { if oldValue != isPlaying { menuState.changed() } }
     }
-    @Published var currentTime: Double = 0
+    /// The playback position lives on its own observable surface because it
+    /// changes many times per second. Most of ContentView observes this model
+    /// and should not redraw for clock ticks.
+    let playbackClock = PlaybackClock()
+    var currentTime: Double {
+        get { playbackClock.currentTime }
+        set { playbackClock.currentTime = newValue }
+    }
     @Published var duration: Double = 0 {
         // Menus only care whether a video is loaded at all (item enabling);
         // ordinary duration refinements shouldn't rebuild an open menu.
@@ -85,8 +91,8 @@ final class PlayerViewModel: ObservableObject {
     }
 
     /// Color characteristics of the current video (HDR vs SDR, bit depth).
-    /// Surfaced so the user knows when an HDR source is being tone-mapped —
-    /// this player's render path is 8-bit, so HDR is always converted down.
+    /// Surfaced so the user knows whether an HDR source is passed through to
+    /// an HDR-capable display or tone-mapped for SDR output.
     @Published private(set) var colorInfo: MPVPlayer.ColorInfo?
 
     /// True while the HDR signal is being passed through to the display
@@ -105,11 +111,16 @@ final class PlayerViewModel: ObservableObject {
     /// display can do, rather than the headroom available at this instant
     /// (which drops when the panel is bright or warm).
     static var displaySupportsHDR: Bool {
-        let headroom = NSScreen.screens
+        VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true,
+            usingHighBitDepth: true,
+            displayHeadroom: maximumDisplayHeadroom)
+    }
+
+    private static var maximumDisplayHeadroom: Double {
+        Double(NSScreen.screens
             .map(\.maximumPotentialExtendedDynamicRangeColorComponentValue)
-            .max() ?? 1.0
-        // A little above 1.0 to ignore rounding on plain SDR panels.
-        return headroom > 1.05
+            .max() ?? 1.0)
     }
 
     /// One-line note shown in the UI for HDR sources — either confirming HDR
@@ -257,6 +268,8 @@ final class PlayerViewModel: ObservableObject {
     /// Bumped on every generate/cancel/load so a stale completion handler
     /// can't overwrite state for a newer transcription.
     private var subtitleGenerationID = 0
+    private var speechModelDownloadTask: Task<Void, Never>?
+    private var speechModelDownloadID = 0
 
     // MARK: Playback engine
 
@@ -339,7 +352,8 @@ final class PlayerViewModel: ObservableObject {
         // Let the subtitle generator surface its internal phases (model
         // download, transcription) in the status row.
         subtitleGenerator.onStatus = { [weak self] status in
-            self?.statusMessage = status
+            guard let self, self.isGeneratingSubtitles else { return }
+            self.statusMessage = status
         }
 
         Task { @MainActor in
@@ -382,9 +396,10 @@ final class PlayerViewModel: ObservableObject {
             // HDR passthrough is only safe on the 16-bit path — PQ at 8 bits
             // per channel bands badly, so tone-map instead if libmpv fell
             // back to the 8-bit format.
-            let wantPassThrough = info.isHDR
-                && self.mpv.usingHighBitDepth
-                && Self.displaySupportsHDR
+            let wantPassThrough = VideoMath.shouldAttemptHDRPassthrough(
+                sourceIsHDR: info.isHDR,
+                usingHighBitDepth: self.mpv.usingHighBitDepth,
+                displayHeadroom: Self.maximumDisplayHeadroom)
             // Only claim HDR if mpv confirms it accepted the PQ target —
             // otherwise the layer would be tagged PQ while mpv is still
             // sending SDR, which looks badly wrong.
@@ -392,9 +407,7 @@ final class PlayerViewModel: ObservableObject {
             self.hdrOutputActive = accepted
 
             if info.isHDR {
-                let headroom = NSScreen.screens
-                    .map(\.maximumPotentialExtendedDynamicRangeColorComponentValue)
-                    .max() ?? 1.0
+                let headroom = Self.maximumDisplayHeadroom
                 let reason: String
                 if accepted {
                     reason = "HDR output active"
@@ -431,15 +444,30 @@ final class PlayerViewModel: ObservableObject {
     /// speech model isn't installed yet, download it right away (instead of
     /// surprising the user with a long stall when they hit Generate).
     func ensureSpeechModelDownloaded() {
+        speechModelDownloadTask?.cancel()
+        speechModelDownloadID += 1
+        let myDownloadID = speechModelDownloadID
+        if statusMessage?.hasPrefix("Downloading speech model") == true {
+            statusMessage = nil
+        }
+
         let locale = subtitleLanguage
         let bcp47 = locale.identifier(.bcp47)
         guard !installedSpeechLocaleIdentifiers.contains(bcp47),
               !isGeneratingSubtitles else { return }
 
-        Task { @MainActor in
+        speechModelDownloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             let supported = await SpeechTranscriber.supportedLocales
                 .contains { $0.identifier(.bcp47) == bcp47 }
-            guard supported else { return } // legacy-engine language; nothing to pre-download
+            guard self.speechModelDownloadID == myDownloadID,
+                  !Task.isCancelled,
+                  supported else {
+                if self.speechModelDownloadID == myDownloadID {
+                    self.speechModelDownloadTask = nil
+                }
+                return // legacy-engine language; nothing to pre-download
+            }
 
             let name = locale.localizedString(forIdentifier: locale.identifier) ?? locale.identifier
             do {
@@ -450,16 +478,40 @@ final class PlayerViewModel: ObservableObject {
                     attributeOptions: [.audioTimeRange]
                 )
                 if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                    guard self.speechModelDownloadID == myDownloadID,
+                          !Task.isCancelled else { return }
                     self.statusMessage = "Downloading speech model for \(name)… (one-time)"
                     print("SuperResVideoPlayer: downloading speech model for \(bcp47)…")
                     try await request.downloadAndInstall()
                     print("SuperResVideoPlayer: speech model for \(bcp47) installed")
                 }
+                guard self.speechModelDownloadID == myDownloadID,
+                      !Task.isCancelled else { return }
                 await self.refreshInstalledSpeechLocales()
-                self.statusMessage = nil
+                if self.speechModelDownloadID == myDownloadID {
+                    if self.statusMessage?.hasPrefix("Downloading speech model") == true {
+                        self.statusMessage = nil
+                    }
+                    self.speechModelDownloadTask = nil
+                }
+            } catch is CancellationError {
+                if self.speechModelDownloadID == myDownloadID {
+                    if self.statusMessage?.hasPrefix("Downloading speech model") == true {
+                        self.statusMessage = nil
+                    }
+                    self.speechModelDownloadTask = nil
+                }
             } catch {
-                self.statusMessage = nil
+                guard self.speechModelDownloadID == myDownloadID else { return }
+                if self.statusMessage?.hasPrefix("Downloading speech model") == true {
+                    self.statusMessage = nil
+                }
+                guard !Task.isCancelled else {
+                    self.speechModelDownloadTask = nil
+                    return
+                }
                 self.subtitleErrorMessage = "Couldn't download the speech model for \(name): \(error.localizedDescription)"
+                self.speechModelDownloadTask = nil
             }
         }
     }
@@ -514,6 +566,11 @@ final class PlayerViewModel: ObservableObject {
         currentAudioTrackID = 0
         currentSubtitleTrackID = 0
         colorInfo = nil
+        // Do not carry the previous file's PQ target/layer state into the new
+        // file while mpv is still discovering its colour metadata. This also
+        // handles audio-only files, which never publish video colour info.
+        _ = mpv.setHDRPassthrough(false)
+        hdrOutputActive = false
 
         // A new video invalidates any subtitles (and in-flight
         // transcription) generated for the previous one.
@@ -602,7 +659,7 @@ final class PlayerViewModel: ObservableObject {
     /// Transcribes the current video's audio in the background and
     /// populates `subtitleCues`. For containers the Speech framework can't
     /// read (MKV, WebM, ...), the audio track is extracted to a temporary
-    /// .m4a first via ffmpeg — fast, and the video itself is untouched.
+    /// 16 kHz WAV first via ffmpeg — fast, and the video itself is untouched.
     func generateSubtitles() {
         guard let url = currentVideoURL, !isGeneratingSubtitles else { return }
 
@@ -618,7 +675,7 @@ final class PlayerViewModel: ObservableObject {
         // picker), not blindly the file's first audio stream.
         let audioStreamIndex = selectedAudioStreamIndex
 
-        Task { @MainActor in
+        Task { @MainActor [self] in
             // Extraction (when needed) is roughly the first 15% of the
             // progress bar; transcription fills the rest.
             func extractAudio() async throws -> URL {
@@ -710,6 +767,10 @@ final class PlayerViewModel: ObservableObject {
     /// to preview the current engine settings quickly.
     func exportEnhancedVideo(durationLimit: Double? = nil) {
         guard let source = currentVideoURL, !isExportingVideo else { return }
+        guard colorInfo?.isHDR != true else {
+            playbackErrorMessage = "HDR export is not supported yet because the export pipeline is SDR-only. Playback HDR handling is unaffected."
+            return
+        }
 
         let panel = NSSavePanel()
         let baseName = (videoTitle as NSString).deletingPathExtension
@@ -730,6 +791,12 @@ final class PlayerViewModel: ObservableObject {
     }
 
     private func startVideoExport(source: URL, destination: URL, durationLimit: Double? = nil) {
+        // Recheck after the save panel closes: video metadata can finish
+        // loading while the panel is open.
+        guard colorInfo?.isHDR != true else {
+            playbackErrorMessage = "HDR export is not supported yet because the export pipeline is SDR-only. Playback HDR handling is unaffected."
+            return
+        }
         isExportingVideo = true
         exportProgress = 0
         playbackErrorMessage = nil
@@ -753,7 +820,7 @@ final class PlayerViewModel: ObservableObject {
         // Free up decode/GPU bandwidth while exporting.
         if isPlaying { togglePlayPause() }
 
-        Task { @MainActor in
+        Task { @MainActor [self] in
             defer {
                 self.isExportingVideo = false
                 self.statusMessage = nil
@@ -837,7 +904,7 @@ final class PlayerViewModel: ObservableObject {
     /// embedded track brings the AI overlay straight back.
     func subtitleText(at time: Double) -> String? {
         guard subtitlesEnabled, currentSubtitleTrackID == 0 else { return nil }
-        return displayedSubtitleCues.first(where: { time >= $0.startTime && time <= $0.endTime })?.text
+        return SubtitleLookup.cue(at: time, in: displayedSubtitleCues)?.text
     }
 
     // MARK: Subtitle translation
