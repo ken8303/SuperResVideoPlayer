@@ -1,6 +1,8 @@
 import Foundation
 import CoreVideo
+import Metal          // MTLPixelFormat, for the renderer's format handshake
 import Cmpv
+import SuperResCore
 
 /// Playback engine backed by libmpv — the same engine IINA embeds — so the
 /// app plays every container/codec mpv's bundled ffmpeg supports (MKV, WebM,
@@ -41,6 +43,63 @@ final class MPVPlayer {
         let generation: UInt64
     }
 
+    /// Color characteristics of the decoded video, read from mpv's
+    /// `video-params`. Used to tell the user when an HDR source is being
+    /// passed through to an HDR display or tone-mapped down to SDR.
+    struct ColorInfo: Equatable {
+        /// Transfer function, from `video-params/gamma`. mpv's current names
+        /// are "pq" (HDR10/Dolby Vision) and "hlg" (broadcast HDR); SDR is
+        /// "bt.1886", "srgb", "gamma2.2", ...
+        let gamma: String?
+        /// Color primaries: "bt.2020" for wide-gamut HDR, "bt.709" for SDR.
+        let primaries: String?
+        /// Peak luminance in cd/m² from HDR10 metadata, 0 when untagged.
+        /// (SDR reference white is ~100 cd/m²; HDR10 typically tags
+        /// 1000–4000.)
+        let maxLuminance: Double
+        /// Bit depth of the decoded source video.
+        let bitDepth: Int
+
+        /// The transfer function is the reliable signal; a luminance tag well
+        /// above SDR reference white is a secondary one for files that are
+        /// HDR but carry an unrecognized gamma name.
+        var isHDR: Bool {
+            VideoMath.isHDRTransferFunction(gamma) || maxLuminance > 200
+        }
+
+        /// Short human-readable summary for the UI.
+        var description: String {
+            guard isHDR else {
+                return bitDepth > 8 ? "SDR \(bitDepth)-bit" : "SDR"
+            }
+            let flavour: String
+            switch gamma?.lowercased() {
+            case "pq", "st2084", "smpte-st2084": flavour = "HDR10 (PQ)"
+            case "hlg", "arib-std-b67": flavour = "HLG"
+            default: flavour = "HDR"
+            }
+            var text = "\(flavour) \(bitDepth)-bit"
+            if maxLuminance > 0 {
+                text += String(format: " · %.0f nits", maxLuminance)
+            }
+            return text
+        }
+    }
+
+    /// One selectable stream inside the container — an audio track (language,
+    /// commentary) or an embedded subtitle track. Mirrors an entry of mpv's
+    /// `track-list`. Only plain value types so it can cross to the main queue.
+    struct Track: Identifiable, Equatable {
+        enum Kind: String { case video, audio, sub, unknown }
+        /// mpv's per-type track id (1-based); the value passed to `aid`/`sid`.
+        let id: Int64
+        let kind: Kind
+        let title: String?
+        let lang: String?
+        let isDefault: Bool
+        let isSelected: Bool
+    }
+
     // MARK: Callbacks (all invoked on the main queue)
 
     var onTimeChanged: ((Double) -> Void)?
@@ -51,6 +110,12 @@ final class MPVPlayer {
     /// initiates itself, e.g. during a buffering stall) — lets the UI's
     /// play/pause button track reality instead of inferring it.
     var onPauseChanged: ((Bool) -> Void)?
+    /// Fired once a file's streams are known (and whenever they change) with
+    /// the full track list, so the UI can offer audio/subtitle track pickers.
+    var onTracksChanged: (([Track]) -> Void)?
+    /// Fired when the decoded video's color characteristics are known, so the
+    /// UI can tell the user an HDR source is being tone-mapped.
+    var onColorInfoChanged: ((ColorInfo) -> Void)?
 
     // MARK: State
 
@@ -67,6 +132,24 @@ final class MPVPlayer {
 
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolSize: (width: Int, height: Int) = (0, 0)
+
+    /// Whether frames are being produced at 16 bits per channel. Starts
+    /// optimistic and latches to false if this libmpv build rejects the
+    /// (undocumented) format — see `renderNewFrame`. Guarded by `stateLock`
+    /// because the renderer reads it from the draw thread to pick matching
+    /// Metal texture formats.
+    private var _usingHighBitDepth = true
+    var usingHighBitDepth: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _usingHighBitDepth
+    }
+
+    /// Metal pixel format of the buffers currently being produced. The
+    /// renderer builds its textures and pipeline state to match.
+    var activeMetalFormat: MTLPixelFormat {
+        usingHighBitDepth ? PipelineFormat.metal : PipelineFormat.Fallback.metal
+    }
 
     /// All mpv software rendering happens on this queue — NEVER on the UI
     /// or MTKView draw path. Rendering inside the draw callback deadlocked
@@ -94,6 +177,8 @@ final class MPVPlayer {
     /// "dispatch_sync called on queue already owned by current thread".
     private static let renderQueueKey = DispatchSpecificKey<Bool>()
 
+    // MARK: Output mode
+
     // MARK: Lifecycle
 
     init() {
@@ -114,6 +199,32 @@ final class MPVPlayer {
         mpv_set_option_string(handle, "terminal", "no")
         mpv_set_option_string(handle, "msg-level", "all=warn")
 
+        // Recent macOS moved its bundled CJK font (PingFang) into a protected
+        // PrivateFrameworks path that libass/FreeType can't open — so
+        // Chinese/Japanese/Korean subtitles fall back to nothing and render
+        // as boxes with the default sans-serif. Point libass at a system CJK
+        // font that lives in a readable location (Songti, in
+        // /System/Library/Fonts/Supplemental) so those glyphs render.
+        // (For guaranteed coverage across all of C/J/K in the shipped app,
+        // bundle a font like Noto Sans CJK and name it here instead.)
+        mpv_set_option_string(handle, "sub-font", "Songti SC")
+        // Detect the encoding of external non-UTF-8 subtitle files (embedded
+        // subs are already UTF-8; harmless there).
+        mpv_set_option_string(handle, "sub-codepage", "auto")
+
+        // --- HDR handling -------------------------------------------------
+        // Start with a deliberate SDR fallback. Once a source is identified
+        // as HDR, PlayerViewModel enables PQ passthrough only when libmpv's
+        // 16-bit software output and the attached display both support it.
+        // Otherwise BT.2390 preserves highlight detail better than a naive
+        // clip.
+        mpv_set_option_string(handle, "tone-mapping", "bt.2390")
+        // Measure each scene's actual peak instead of trusting static
+        // metadata, which is frequently wrong or absent.
+        mpv_set_option_string(handle, "hdr-compute-peak", "yes")
+        // Map out-of-gamut BT.2020 colors instead of clipping them.
+        mpv_set_option_string(handle, "gamut-mapping-mode", "perceptual")
+
         guard mpv_initialize(handle) >= 0 else {
             print("SuperResVideoPlayer: mpv_initialize failed — playback unavailable.")
             mpv_terminate_destroy(handle)
@@ -125,13 +236,39 @@ final class MPVPlayer {
         mpv_observe_property(handle, 0, "duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "eof-reached", MPV_FORMAT_FLAG)
         mpv_observe_property(handle, 0, "pause", MPV_FORMAT_FLAG)
+        // Format NONE = "notify me it changed" without marshalling a value;
+        // we re-read the whole list when it fires (see readTracks()).
+        mpv_observe_property(handle, 0, "track-list", MPV_FORMAT_NONE)
+        mpv_observe_property(handle, 0, "video-params", MPV_FORMAT_NONE)
 
         createRenderContext()
         startEventThread()
     }
 
     deinit {
+        shutdown()
+    }
+
+    /// Tears the engine down deterministically. Idempotent, and safe to call
+    /// explicitly before dropping the last reference — which
+    /// `PlayerViewModel.rebuild` does when switching output modes.
+    ///
+    /// The ordering here is load-bearing. The previous version sent "quit"
+    /// and let the event thread call `mpv_terminate_destroy` when it saw
+    /// MPV_EVENT_SHUTDOWN. That races: the event thread can free the handle
+    /// while `mpv_command` is still executing on this thread, which segfaults
+    /// inside libmpv's run_client_command. It never showed up while the only
+    /// teardown was at process exit; destroying a player mid-session (an
+    /// output-mode switch) makes it reproducible.
+    ///
+    /// So: stop the event loop and *wait for that thread to exit* before
+    /// destroying the handle. After the join, nothing else can touch it.
+    func shutdown() {
         stateLock.lock()
+        if shuttingDown {
+            stateLock.unlock()
+            return
+        }
         shuttingDown = true
         let context = renderContext
         renderContext = nil
@@ -139,9 +276,9 @@ final class MPVPlayer {
 
         // The render context must be freed before the handle is destroyed,
         // and only after any in-flight render on renderQueue has drained.
-        // If deinit is itself running ON renderQueue (a render-queue block
-        // dropped the last reference), the queue is serial so nothing else
-        // can be mid-render — and a sync here would deadlock-trap.
+        // If this is running ON renderQueue (a render-queue block dropped the
+        // last reference), the queue is serial so nothing else can be
+        // mid-render — and a sync here would deadlock-trap.
         if let context {
             mpv_render_context_set_update_callback(context, nil, nil)
             if DispatchQueue.getSpecific(key: Self.renderQueueKey) != true {
@@ -150,11 +287,28 @@ final class MPVPlayer {
             mpv_render_context_free(context)
         }
         callbackBox?.release()
-        if handle != nil {
-            // The event thread sees MPV_EVENT_SHUTDOWN and calls
-            // mpv_terminate_destroy — the documented teardown pattern.
-            command(["quit"])
+        callbackBox = nil
+
+        guard let handle else { return }
+        self.handle = nil   // no further commands can reach libmpv
+
+        // Ask the loop to stop, then join it. It polls with a short timeout,
+        // so this returns promptly; the timeout is a backstop against a
+        // wedged thread rather than an expected path.
+        eventControl.stop()
+        if eventThreadStarted {
+            if eventThreadFinished.wait(timeout: .now() + 2) == .timedOut {
+                // The handle is still potentially in use. Destroying it here
+                // would recreate the shutdown race this ordering prevents.
+                print("SuperResVideoPlayer: mpv event thread did not stop within 2s; deferring handle cleanup.")
+                let cleanup = DeferredHandleCleanup(
+                    handle: handle, finished: eventThreadFinished)
+                DispatchQueue.global(qos: .utility).async { cleanup.run() }
+                return
+            }
         }
+        // Sole owner now — safe to destroy.
+        mpv_terminate_destroy(handle)
     }
 
     private func createRenderContext() {
@@ -191,13 +345,57 @@ final class MPVPlayer {
 
     // MARK: Event loop
 
+    /// Stop flag for the event loop, in its own object so the thread can own
+    /// it strongly without keeping the player alive.
+    private final class EventLoopControl {
+        private let lock = NSLock()
+        private var _stopped = false
+        var isStopped: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return _stopped
+        }
+        func stop() { lock.lock(); _stopped = true; lock.unlock() }
+    }
+    private let eventControl = EventLoopControl()
+    private let eventThreadFinished = DispatchSemaphore(value: 0)
+    private var eventThreadStarted = false
+
+    /// Owns a raw mpv handle after the player itself has gone away. Used only
+    /// when the event thread misses its shutdown deadline: destruction is
+    /// deferred until that thread truly exits instead of racing it.
+    private final class DeferredHandleCleanup: @unchecked Sendable {
+        let handle: OpaquePointer
+        let finished: DispatchSemaphore
+
+        init(handle: OpaquePointer, finished: DispatchSemaphore) {
+            self.handle = handle
+            self.finished = finished
+        }
+
+        func run() {
+            finished.wait()
+            mpv_terminate_destroy(handle)
+        }
+    }
+
     private func startEventThread() {
         guard let handle else { return }
+        eventThreadStarted = true
+        // Captured strongly: these must outlive the player so `shutdown()`
+        // can join the thread even as the last reference goes away.
+        let control = eventControl
+        let finished = eventThreadFinished
         let thread = Thread { [weak self] in
+            defer { finished.signal() }
             while true {
-                guard let event = mpv_wait_event(handle, -1) else { continue }
+                // Poll rather than block forever, so shutdown() can stop the
+                // loop without needing to interrupt libmpv from outside.
+                guard !control.isStopped else { return }
+                guard let event = mpv_wait_event(handle, 0.1) else { continue }
+                if event.pointee.event_id == MPV_EVENT_NONE { continue }
                 if event.pointee.event_id == MPV_EVENT_SHUTDOWN {
-                    mpv_terminate_destroy(handle)
+                    // Do NOT destroy the handle here — shutdown() owns that,
+                    // and doing it on both sides is what caused the crash.
                     return
                 }
                 self?.handleEvent(event)
@@ -253,9 +451,20 @@ final class MPVPlayer {
                     let paused = raw.assumingMemoryBound(to: Int32.self).pointee != 0
                     DispatchQueue.main.async { [weak self] in self?.onPauseChanged?(paused) }
                 }
+            case "track-list":
+                publishTracks()
+            case "video-params":
+                publishColorInfo()
             default:
                 break
             }
+
+        case MPV_EVENT_FILE_LOADED:
+            // Streams are fully known here — reliable point to populate the
+            // audio/subtitle pickers even if the track-list observer already
+            // fired with partial info.
+            publishTracks()
+            publishColorInfo()
 
         case MPV_EVENT_END_FILE:
             guard let data = event.pointee.data else { return }
@@ -279,6 +488,7 @@ final class MPVPlayer {
         _latestFrame = nil
         mediaGeneration &+= 1
         observedPlaybackTime = 0
+        _pendingTimePos = nil
         stateLock.unlock()
 
         command(["loadfile", url.path, "replace"])
@@ -301,8 +511,172 @@ final class MPVPlayer {
         command(["seek", String(seconds), "absolute+exact"])
     }
 
+    /// mpv's software volume, 0...100 (values above 100 amplify; we don't).
+    func setVolume(_ percent: Double) {
+        guard let handle else { return }
+        var value = min(100, max(0, percent))
+        mpv_set_property(handle, "volume", MPV_FORMAT_DOUBLE, &value)
+    }
+
+    func setMuted(_ muted: Bool) {
+        guard let handle else { return }
+        var flag: Int32 = muted ? 1 : 0
+        mpv_set_property(handle, "mute", MPV_FORMAT_FLAG, &flag)
+    }
+
+    // MARK: HDR output
+
+    /// Switches mpv between tone-mapping HDR down to SDR and handing the HDR
+    /// signal through untouched.
+    ///
+    /// With `passthrough` on, mpv is told the render target is PQ / BT.2020,
+    /// so it stops compressing the signal to SDR range and writes PQ-encoded
+    /// values into our 16-bit buffers. The layer is then told those values
+    /// are PQ (see `MetalVideoView`), and macOS maps them onto the display's
+    /// extended dynamic range.
+    ///
+    /// Only meaningful because the software render path is 16-bit — at 8 bits
+    /// per channel, PQ banding would be severe.
+    /// - Returns: whether mpv actually accepted the HDR target. `target-trc`
+    ///   and `target-prim` are `vo=gpu` options and may be ignored on the
+    ///   software render path, so the values are read back rather than
+    ///   assumed. Setting `tone-mapping=clip` while mpv is still mapping to
+    ///   SDR would hard-clip highlights — a blown-out picture — so that is
+    ///   only applied once passthrough is confirmed.
+    @discardableResult
+    func setHDRPassthrough(_ passthrough: Bool) -> Bool {
+        guard let handle else { return false }
+
+        guard passthrough else {
+            mpv_set_property_string(handle, "target-trc", "auto")
+            mpv_set_property_string(handle, "target-prim", "auto")
+            mpv_set_property_string(handle, "tone-mapping", "bt.2390")
+            return false
+        }
+
+        mpv_set_property_string(handle, "target-trc", "pq")
+        mpv_set_property_string(handle, "target-prim", "bt.2020")
+
+        let trc = getPropertyString("target-trc") ?? "?"
+        let prim = getPropertyString("target-prim") ?? "?"
+        let accepted = trc.lowercased() == "pq"
+        print("SuperResVideoPlayer: requested PQ target — mpv reports target-trc=\(trc), target-prim=\(prim)")
+
+        if accepted {
+            // Safe now: the target covers the source, so there is nothing to
+            // compress and "clip" is a no-op rather than a highlight crusher.
+            mpv_set_property_string(handle, "tone-mapping", "clip")
+        } else {
+            // Fall back to a good tone-map rather than leaving the signal
+            // half-converted.
+            print("SuperResVideoPlayer: libmpv ignored the PQ target on the software render path — tone-mapping to SDR instead.")
+            mpv_set_property_string(handle, "target-trc", "auto")
+            mpv_set_property_string(handle, "target-prim", "auto")
+            mpv_set_property_string(handle, "tone-mapping", "bt.2390")
+        }
+        return accepted
+    }
+
+    // MARK: Track selection
+
+    /// Switch the active audio track by its mpv id (from `Track.id`).
+    func setAudioTrack(_ id: Int64) {
+        guard let handle else { return }
+        mpv_set_property_string(handle, "aid", String(id))
+    }
+
+    /// Switch the active embedded subtitle track by id, or pass `nil` to turn
+    /// embedded subtitles off. (These are the container's own subtitles,
+    /// rendered by mpv into the frame — separate from the app's AI subtitles.)
+    func setSubtitleTrack(_ id: Int64?) {
+        guard let handle else { return }
+        mpv_set_property_string(handle, "sid", id.map(String.init) ?? "no")
+    }
+
+    /// Reads the decoded video's color characteristics and delivers them on
+    /// the main queue. Only publishes once the values are actually known
+    /// (mpv reports empty video-params before the first frame is decoded).
+    private func publishColorInfo() {
+        guard let handle else { return }
+        let gamma = getPropertyString("video-params/gamma")
+        let primaries = getPropertyString("video-params/primaries")
+        guard gamma != nil || primaries != nil else { return }
+
+        // Peak luminance. `max-luma` (absolute cd/m²) is the current
+        // property; `sig-peak` is deprecated and expressed as a multiple of
+        // SDR reference white, so older mpv builds are converted at the
+        // conventional 100 cd/m² reference.
+        var maxLuma: Double = 0
+        if mpv_get_property(handle, "video-params/max-luma", MPV_FORMAT_DOUBLE, &maxLuma) < 0
+            || maxLuma <= 0 {
+            var legacyPeak: Double = 0
+            if mpv_get_property(handle, "video-params/sig-peak", MPV_FORMAT_DOUBLE, &legacyPeak) >= 0,
+               legacyPeak > 1.01 {
+                maxLuma = legacyPeak * 100
+            } else {
+                maxLuma = 0
+            }
+        }
+
+        // mpv has no bit-depth property — the depth is encoded in the pixel
+        // format name (yuv420p10le, p010, gbrp12le, ...).
+        let bitDepth = VideoMath.bitDepth(fromPixelFormat: getPropertyString("video-params/pixelformat"))
+
+        let info = ColorInfo(
+            gamma: gamma,
+            primaries: primaries,
+            maxLuminance: maxLuma,
+            bitDepth: bitDepth
+        )
+        DispatchQueue.main.async { [weak self] in self?.onColorInfoChanged?(info) }
+    }
+
+    /// Reads mpv's current `track-list` and delivers it on the main queue.
+    /// Safe to call from the event thread — the mpv client API is thread-safe.
+    private func publishTracks() {
+        let tracks = readTracks()
+        DispatchQueue.main.async { [weak self] in self?.onTracksChanged?(tracks) }
+    }
+
+    private func readTracks() -> [Track] {
+        guard let handle else { return [] }
+        var count: Int64 = 0
+        guard mpv_get_property(handle, "track-list/count", MPV_FORMAT_INT64, &count) >= 0,
+              count > 0 else { return [] }
+
+        var tracks: [Track] = []
+        for index in 0..<count {
+            var id: Int64 = 0
+            mpv_get_property(handle, "track-list/\(index)/id", MPV_FORMAT_INT64, &id)
+            let type = getPropertyString("track-list/\(index)/type") ?? "unknown"
+            let title = getPropertyString("track-list/\(index)/title")
+            let lang = getPropertyString("track-list/\(index)/lang")
+            var isDefault: Int32 = 0
+            mpv_get_property(handle, "track-list/\(index)/default", MPV_FORMAT_FLAG, &isDefault)
+            var isSelected: Int32 = 0
+            mpv_get_property(handle, "track-list/\(index)/selected", MPV_FORMAT_FLAG, &isSelected)
+            tracks.append(Track(id: id,
+                                kind: Track.Kind(rawValue: type) ?? .unknown,
+                                title: title,
+                                lang: lang,
+                                isDefault: isDefault != 0,
+                                isSelected: isSelected != 0))
+        }
+        return tracks
+    }
+
+    /// mpv returns a heap-allocated C string that must be freed with mpv_free.
+    /// Empty strings become nil so the UI can fall back to a generic label.
+    private func getPropertyString(_ name: String) -> String? {
+        guard let handle, let cString = mpv_get_property_string(handle, name) else { return nil }
+        defer { mpv_free(cString) }
+        let value = String(cString: cString)
+        return value.isEmpty ? nil : value
+    }
+
     /// Current playback position in seconds. Thread-safe; used by the
-    /// renderer every draw to compute the interpolation phase.
+    /// renderer every draw to compute the interpolation phase. This is the
+    /// cached observed value, not a synchronous libmpv query on the hot path.
     var playbackTime: Double {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -352,9 +726,14 @@ final class MPVPlayer {
         var size: [Int32] = [Int32(width), Int32(height)]
         var stride: Int = CVPixelBufferGetBytesPerRow(pixelBuffer)
 
-        // "bgr0" = byte order B,G,R,unused — matches kCVPixelFormatType_32BGRA
-        // (the alpha byte is ignored downstream; the video pipeline never blends).
-        let status = "bgr0".withCString { format -> Int32 in
+        // 16-bit ("rgba64le") when the build accepts it, else 8-bit "bgr0".
+        // Both match their CVPixelBuffer layout byte for byte; the alpha
+        // channel is ignored downstream, as the pipeline never blends.
+        let formatName = usingHighBitDepth
+            ? PipelineFormat.mpvSoftwareFormat
+            : PipelineFormat.Fallback.mpvSoftwareFormat
+
+        let status = formatName.withCString { format -> Int32 in
             size.withUnsafeMutableBufferPointer { sizePointer in
                 withUnsafeMutablePointer(to: &stride) { stridePointer -> Int32 in
                     var params = [
@@ -373,7 +752,20 @@ final class MPVPlayer {
             }
         }
         CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-        guard status >= 0 else { return }
+
+        guard status >= 0 else {
+            // The 16-bit format is undocumented, so a libmpv build that
+            // doesn't accept it must not break playback — drop to 8-bit
+            // permanently and pick up from the next frame.
+            if usingHighBitDepth {
+                print("SuperResVideoPlayer: libmpv rejected \(formatName) (\(status)) — falling back to 8-bit output.")
+                stateLock.lock()
+                _usingHighBitDepth = false
+                stateLock.unlock()
+                pixelBufferPool = nil   // reallocate in the fallback format
+            }
+            return
+        }
 
         let timeSeconds = getDoubleUnlocked("time-pos") ?? 0
         stateLock.lock()
@@ -396,7 +788,9 @@ final class MPVPlayer {
 
     private func rebuildPixelBufferPool(width: Int, height: Int) {
         let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: usingHighBitDepth
+                ? PipelineFormat.coreVideo
+                : PipelineFormat.Fallback.coreVideo,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferMetalCompatibilityKey as String: true,

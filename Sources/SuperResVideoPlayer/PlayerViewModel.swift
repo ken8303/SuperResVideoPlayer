@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import UniformTypeIdentifiers
 import Speech
+import SuperResCore
 
 /// Which implementation the AI Image Enhancer uses.
 enum EnhancerEngine: String, CaseIterable, Identifiable {
@@ -17,17 +18,119 @@ enum EnhancerEngine: String, CaseIterable, Identifiable {
 /// natively — no conversion step.
 final class PlayerViewModel: ObservableObject {
 
+    /// Refresh channel for the settings menus (video context menu + "Video"
+    /// menu-bar menu). Menus must NOT observe the view model itself:
+    /// `pipelineStatus` updates every second, and rebuilding an open NSMenu
+    /// that often makes it flash and impossible to click. This object fires
+    /// only when a value the menus actually display changes.
+    final class MenuState: ObservableObject {
+        fileprivate func changed() { objectWillChange.send() }
+    }
+    let menuState = MenuState()
+
     // MARK: Published UI state
 
-    @Published var isPlaying = false
-    @Published var currentTime: Double = 0
-    @Published var duration: Double = 0
+    // Drives the Playback menu's Play/Pause label.
+    @Published var isPlaying = false {
+        didSet { if oldValue != isPlaying { menuState.changed() } }
+    }
+    /// The playback position lives on its own observable surface because it
+    /// changes many times per second. Most of ContentView observes this model
+    /// and should not redraw for clock ticks.
+    let playbackClock = PlaybackClock()
+    var currentTime: Double {
+        get { playbackClock.currentTime }
+        set { playbackClock.currentTime = newValue }
+    }
+    @Published var duration: Double = 0 {
+        // Menus only care whether a video is loaded at all (item enabling);
+        // ordinary duration refinements shouldn't rebuild an open menu.
+        didSet { if (oldValue == 0) != (duration == 0) { menuState.changed() } }
+    }
     @Published var videoTitle: String = "No video loaded"
     @Published var isScrubbing = false
+
+    /// Playback volume, 0...100 (mpv's software volume). Persisted; mute is
+    /// deliberately not (a fresh launch shouldn't start silent).
+    @Published var volume: Double = 100 {
+        didSet {
+            mpv.setVolume(volume)
+            Defaults.set(volume, .volume)
+        }
+    }
+    @Published var isMuted = false {
+        // Drives the Playback menu's Mute/Unmute label.
+        didSet {
+            mpv.setMuted(isMuted)
+            if oldValue != isMuted { menuState.changed() }
+        }
+    }
 
     /// Set when a file fails to open/decode, so the UI can say why nothing
     /// is playing instead of silently showing a black view.
     @Published var playbackErrorMessage: String?
+
+    // MARK: Audio / subtitle track selection (the container's own streams)
+
+    /// Selectable audio tracks in the current file (languages, commentary).
+    @Published private(set) var audioTracks: [MPVPlayer.Track] = [] {
+        didSet { if oldValue != audioTracks { menuState.changed() } }
+    }
+    /// Embedded subtitle tracks in the current file — mpv renders these into
+    /// the frame, separate from the app's AI-generated subtitles.
+    @Published private(set) var subtitleTracks: [MPVPlayer.Track] = [] {
+        didSet { if oldValue != subtitleTracks { menuState.changed() } }
+    }
+    /// mpv id of the active audio track (0 = none selected yet).
+    @Published private(set) var currentAudioTrackID: Int64 = 0 {
+        didSet { if oldValue != currentAudioTrackID { menuState.changed() } }
+    }
+    /// mpv id of the active embedded subtitle track (0 = off).
+    @Published private(set) var currentSubtitleTrackID: Int64 = 0 {
+        didSet { if oldValue != currentSubtitleTrackID { menuState.changed() } }
+    }
+
+    /// Color characteristics of the current video (HDR vs SDR, bit depth).
+    /// Surfaced so the user knows whether an HDR source is passed through to
+    /// an HDR-capable display or tone-mapped for SDR output.
+    @Published private(set) var colorInfo: MPVPlayer.ColorInfo?
+
+    /// True while the HDR signal is being passed through to the display
+    /// rather than tone-mapped. Drives the layer's colour space.
+    @Published private(set) var hdrOutputActive = false
+
+    /// Whether any attached display can actually show more than SDR white.
+    ///
+    /// This gates HDR passthrough, and its absence was a real bug: handing
+    /// PQ to a display with no extended range doesn't produce HDR, it
+    /// *clips* — highlights slam to white while everything else looks
+    /// roughly normal. Every log line said HDR was working; the picture
+    /// disagreed, because the display had nowhere to put the extra range.
+    ///
+    /// `maximumPotential…` is the right property: it reports what the
+    /// display can do, rather than the headroom available at this instant
+    /// (which drops when the panel is bright or warm).
+    static var displaySupportsHDR: Bool {
+        VideoMath.shouldAttemptHDRPassthrough(
+            sourceIsHDR: true,
+            usingHighBitDepth: true,
+            displayHeadroom: maximumDisplayHeadroom)
+    }
+
+    private static var maximumDisplayHeadroom: Double {
+        Double(NSScreen.screens
+            .map(\.maximumPotentialExtendedDynamicRangeColorComponentValue)
+            .max() ?? 1.0)
+    }
+
+    /// One-line note shown in the UI for HDR sources — either confirming HDR
+    /// is reaching the display, or explaining the tone-map. nil for SDR.
+    var hdrNotice: String? {
+        guard let colorInfo, colorInfo.isHDR else { return nil }
+        return hdrOutputActive
+            ? "\(colorInfo.description) — HDR output"
+            : "\(colorInfo.description) — tone-mapped to SDR"
+    }
 
     /// One-line description of whatever long-running background work is in
     /// flight (audio extraction, model downloads, transcription,
@@ -41,7 +144,10 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: Video export state
 
-    @Published var isExportingVideo = false
+    // Drives the enabled state of Open/Export items in the menus.
+    @Published var isExportingVideo = false {
+        didSet { if oldValue != isExportingVideo { menuState.changed() } }
+    }
     @Published var exportProgress: Double = 0
     private var videoExporter: VideoExporter?
 
@@ -52,20 +158,49 @@ final class PlayerViewModel: ObservableObject {
 
     /// AI Image Enhancer: same-resolution cleanup applied before Super
     /// Resolution. See `EnhancerEngine` for the three implementations.
-    @Published var imageEnhancementEnabled = false
-    @Published var enhancementEngine: EnhancerEngine = .classic
-    @Published var enhancementStrength: Double = 0.5
+    /// These enhancement/quality settings persist across launches (see
+    /// `Defaults` and `restoreSettings()`).
+    @Published var imageEnhancementEnabled = false {
+        didSet {
+            Defaults.set(imageEnhancementEnabled, .imageEnhancementEnabled)
+            if oldValue != imageEnhancementEnabled { menuState.changed() }
+        }
+    }
+    @Published var enhancementEngine: EnhancerEngine = .classic {
+        didSet {
+            Defaults.set(enhancementEngine.rawValue, .enhancementEngine)
+            if oldValue != enhancementEngine { menuState.changed() }
+        }
+    }
+    @Published var enhancementStrength: Double = 0.5 {
+        didSet { Defaults.set(enhancementStrength, .enhancementStrength) }
+    }
 
     /// Toggle for enabling/disabling MetalFX Super Resolution upscaling.
-    @Published var superResolutionEnabled = true
+    @Published var superResolutionEnabled = true {
+        didSet {
+            Defaults.set(superResolutionEnabled, .superResolutionEnabled)
+            if oldValue != superResolutionEnabled { menuState.changed() }
+        }
+    }
 
     /// Target upscale factor applied by MetalFX when Super Resolution is on.
-    @Published var upscaleFactor: Double = 1.5
+    @Published var upscaleFactor: Double = 1.5 {
+        didSet {
+            Defaults.set(upscaleFactor, .upscaleFactor)
+            if oldValue != upscaleFactor { menuState.changed() }
+        }
+    }
 
     /// AI Frame Interpolation smoothing multiplier: 1 = off, 2 = one
     /// synthesized in-between frame per real pair (native MetalFX), 3 = two
     /// synthesized frames per real pair (custom warp fallback).
-    @Published var frameInterpolationMultiplier: Int = 1
+    @Published var frameInterpolationMultiplier: Int = 1 {
+        didSet {
+            Defaults.set(frameInterpolationMultiplier, .frameInterpolationMultiplier)
+            if oldValue != frameInterpolationMultiplier { menuState.changed() }
+        }
+    }
 
     /// Set by `Renderer` if MetalFX spatial scaling is unsupported on this GPU.
     @Published var superResolutionUnsupported = false
@@ -77,17 +212,24 @@ final class PlayerViewModel: ObservableObject {
     // MARK: AI Subtitle Generator state
 
     @Published var subtitleCues: [SubtitleCue] = [] {
-        didSet { subtitleTimeline = nil }
+        // Menus only show whether cues exist (AI Subtitles enabled state).
+        didSet { subtitleTimeline = nil; if oldValue.isEmpty != subtitleCues.isEmpty { menuState.changed() } }
+    }
+    @Published var subtitlesEnabled = true {
+        didSet { if oldValue != subtitlesEnabled { menuState.changed() } }
+    }
+    @Published var isGeneratingSubtitles = false {
+        didSet { if oldValue != isGeneratingSubtitles { menuState.changed() } }
     }
     private var subtitleTimeline: SubtitleTimeline?
-    @Published var subtitlesEnabled = true
-    @Published var isGeneratingSubtitles = false
     @Published var subtitleGenerationProgress: Double = 0
     @Published var subtitleErrorMessage: String?
 
-    /// Spoken language to transcribe. Defaults to the system's current
-    /// locale if the Speech framework supports it on this Mac.
-    @Published var subtitleLanguage: Locale = .current
+    /// Spoken language to transcribe. Restored from the last session if it's
+    /// still supported, else the system's current locale.
+    @Published var subtitleLanguage: Locale = .current {
+        didSet { Defaults.set(subtitleLanguage.identifier, .subtitleLanguage) }
+    }
 
     /// Locales this Mac's Speech framework can recognize, for the language picker.
     private(set) var availableSubtitleLocales: [Locale] = []
@@ -130,25 +272,102 @@ final class PlayerViewModel: ObservableObject {
     /// Bumped on every generate/cancel/load so a stale completion handler
     /// can't overwrite state for a newer transcription.
     private var subtitleGenerationID = 0
+    private var speechModelDownloadTask: Task<Void, Never>?
+    private var speechModelDownloadID = 0
 
     // MARK: Playback engine
 
     /// libmpv-backed engine. The Metal renderer reads frames from it
     /// directly (via the settings snapshot pushed in MetalVideoView).
+    ///
     let mpv = MPVPlayer()
+
+    /// Keys + typed accessors for the settings that persist across launches.
+    enum Defaults: String {
+        case imageEnhancementEnabled, enhancementEngine, enhancementStrength
+        case superResolutionEnabled, upscaleFactor, frameInterpolationMultiplier
+        case volume, subtitleLanguage
+
+        static func set(_ value: Any, _ key: Defaults) {
+            UserDefaults.standard.set(value, forKey: key.rawValue)
+        }
+        static func has(_ key: Defaults) -> Bool {
+            UserDefaults.standard.object(forKey: key.rawValue) != nil
+        }
+        static func double(_ key: Defaults) -> Double { UserDefaults.standard.double(forKey: key.rawValue) }
+        static func integer(_ key: Defaults) -> Int { UserDefaults.standard.integer(forKey: key.rawValue) }
+        static func bool(_ key: Defaults) -> Bool { UserDefaults.standard.bool(forKey: key.rawValue) }
+        static func string(_ key: Defaults) -> String? { UserDefaults.standard.string(forKey: key.rawValue) }
+    }
+
+    /// Restores persisted quality/enhancement settings.
+    ///
+    /// Called as a method from `init` (not by direct assignment inside it),
+    /// so the property observers *do* fire — each restored value writes
+    /// itself straight back to defaults, which is harmless, and `volume`
+    /// reaches mpv on its own. The explicit `mpv.setVolume` in `init` is
+    /// belt-and-braces for the case where nothing was persisted.
+    private func restoreSettings() {
+        if Defaults.has(.imageEnhancementEnabled) {
+            imageEnhancementEnabled = Defaults.bool(.imageEnhancementEnabled)
+        }
+        if let raw = Defaults.string(.enhancementEngine), let engine = EnhancerEngine(rawValue: raw) {
+            enhancementEngine = engine
+        }
+        if Defaults.has(.enhancementStrength) {
+            enhancementStrength = Defaults.double(.enhancementStrength)
+        }
+        if Defaults.has(.superResolutionEnabled) {
+            superResolutionEnabled = Defaults.bool(.superResolutionEnabled)
+        }
+        if Defaults.has(.upscaleFactor) {
+            // Guard against a value outside the picker's options.
+            let saved = Defaults.double(.upscaleFactor)
+            if [1.3, 1.5, 2.0].contains(saved) { upscaleFactor = saved }
+        }
+        if Defaults.has(.frameInterpolationMultiplier) {
+            let saved = Defaults.integer(.frameInterpolationMultiplier)
+            if (1...3).contains(saved) { frameInterpolationMultiplier = saved }
+        }
+        if Defaults.has(.volume) {
+            volume = min(100, max(0, Defaults.double(.volume)))
+        }
+    }
 
     init() {
         let supported = SubtitleGenerator.supportedLocales
         availableSubtitleLocales = supported
         let current = Locale.current
-        // Assign the matched *supported* Locale instance (not `current`):
-        // Locale equality is stricter than identifier equality, and the
-        // Picker's tag matching needs `subtitleLanguage` to equal one of
-        // the instances in `availableSubtitleLocales`.
-        subtitleLanguage = supported.first(where: { $0.identifier == current.identifier })
+        // Prefer the language used last time, else the system locale —
+        // assigning the matched *supported* Locale instance (not `current`),
+        // since Locale equality is stricter than identifier equality and the
+        // Picker's tag matching needs an instance from `availableSubtitleLocales`.
+        let preferredIdentifier = Defaults.string(.subtitleLanguage) ?? current.identifier
+        subtitleLanguage = supported.first(where: { $0.identifier == preferredIdentifier })
+            ?? supported.first(where: { $0.identifier == current.identifier })
             ?? supported.first
             ?? current
 
+        restoreSettings()
+        // Observers don't fire during init — push the restored volume through.
+        mpv.setVolume(volume)
+        wirePlayerCallbacks()
+
+        // Let the subtitle generator surface its internal phases (model
+        // download, transcription) in the status row.
+        subtitleGenerator.onStatus = { [weak self] status in
+            guard let self, self.isGeneratingSubtitles else { return }
+            self.statusMessage = status
+        }
+
+        Task { @MainActor in
+            await self.refreshInstalledSpeechLocales()
+        }
+    }
+
+    /// Attaches the view model's handlers to `mpv`. Called from `init` and
+    /// again whenever the engine is rebuilt for an output-mode change.
+    private func wirePlayerCallbacks() {
         // mpv event callbacks (all delivered on the main queue).
         mpv.onTimeChanged = { [weak self] seconds in
             guard let self, !self.isScrubbing else { return }
@@ -173,9 +392,47 @@ final class PlayerViewModel: ObservableObject {
             self.playbackErrorMessage = "Couldn't play this video: \(message)"
             self.isPlaying = false
         }
+        mpv.onColorInfoChanged = { [weak self] info in
+            guard let self else { return }
+            guard self.colorInfo != info else { return }
+            self.colorInfo = info
 
-        Task { @MainActor in
-            await self.refreshInstalledSpeechLocales()
+            // HDR passthrough is only safe on the 16-bit path — PQ at 8 bits
+            // per channel bands badly, so tone-map instead if libmpv fell
+            // back to the 8-bit format.
+            let wantPassThrough = VideoMath.shouldAttemptHDRPassthrough(
+                sourceIsHDR: info.isHDR,
+                usingHighBitDepth: self.mpv.usingHighBitDepth,
+                displayHeadroom: Self.maximumDisplayHeadroom)
+            // Only claim HDR if mpv confirms it accepted the PQ target —
+            // otherwise the layer would be tagged PQ while mpv is still
+            // sending SDR, which looks badly wrong.
+            let accepted = self.mpv.setHDRPassthrough(wantPassThrough)
+            self.hdrOutputActive = accepted
+
+            if info.isHDR {
+                let headroom = Self.maximumDisplayHeadroom
+                let reason: String
+                if accepted {
+                    reason = "HDR output active"
+                } else if !Self.displaySupportsHDR {
+                    reason = String(format: "tone-mapped to SDR (display headroom %.2f — no extended range)", headroom)
+                } else if !self.mpv.usingHighBitDepth {
+                    reason = "tone-mapped to SDR (8-bit render path)"
+                } else {
+                    reason = "tone-mapped to SDR"
+                }
+                print("SuperResVideoPlayer: \(info.description) — \(reason)")
+            }
+        }
+        mpv.onTracksChanged = { [weak self] tracks in
+            guard let self else { return }
+            self.audioTracks = tracks.filter { $0.kind == .audio }
+            self.subtitleTracks = tracks.filter { $0.kind == .sub }
+            // Reflect whatever mpv auto-selected so the pickers open on the
+            // right row (a subtitle track may be auto-selected as default).
+            self.currentAudioTrackID = self.audioTracks.first(where: { $0.isSelected })?.id ?? 0
+            self.currentSubtitleTrackID = self.subtitleTracks.first(where: { $0.isSelected })?.id ?? 0
         }
     }
 
@@ -191,15 +448,30 @@ final class PlayerViewModel: ObservableObject {
     /// speech model isn't installed yet, download it right away (instead of
     /// surprising the user with a long stall when they hit Generate).
     func ensureSpeechModelDownloaded() {
+        speechModelDownloadTask?.cancel()
+        speechModelDownloadID += 1
+        let myDownloadID = speechModelDownloadID
+        if statusMessage?.hasPrefix("Downloading speech model") == true {
+            statusMessage = nil
+        }
+
         let locale = subtitleLanguage
         let bcp47 = locale.identifier(.bcp47)
         guard !installedSpeechLocaleIdentifiers.contains(bcp47),
               !isGeneratingSubtitles else { return }
 
-        Task { @MainActor in
+        speechModelDownloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             let supported = await SpeechTranscriber.supportedLocales
                 .contains { $0.identifier(.bcp47) == bcp47 }
-            guard supported else { return } // legacy-engine language; nothing to pre-download
+            guard self.speechModelDownloadID == myDownloadID,
+                  !Task.isCancelled,
+                  supported else {
+                if self.speechModelDownloadID == myDownloadID {
+                    self.speechModelDownloadTask = nil
+                }
+                return // legacy-engine language; nothing to pre-download
+            }
 
             let name = locale.localizedString(forIdentifier: locale.identifier) ?? locale.identifier
             do {
@@ -210,16 +482,40 @@ final class PlayerViewModel: ObservableObject {
                     attributeOptions: [.audioTimeRange]
                 )
                 if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                    guard self.speechModelDownloadID == myDownloadID,
+                          !Task.isCancelled else { return }
                     self.statusMessage = "Downloading speech model for \(name)… (one-time)"
                     print("SuperResVideoPlayer: downloading speech model for \(bcp47)…")
                     try await request.downloadAndInstall()
                     print("SuperResVideoPlayer: speech model for \(bcp47) installed")
                 }
+                guard self.speechModelDownloadID == myDownloadID,
+                      !Task.isCancelled else { return }
                 await self.refreshInstalledSpeechLocales()
-                self.statusMessage = nil
+                if self.speechModelDownloadID == myDownloadID {
+                    if self.statusMessage?.hasPrefix("Downloading speech model") == true {
+                        self.statusMessage = nil
+                    }
+                    self.speechModelDownloadTask = nil
+                }
+            } catch is CancellationError {
+                if self.speechModelDownloadID == myDownloadID {
+                    if self.statusMessage?.hasPrefix("Downloading speech model") == true {
+                        self.statusMessage = nil
+                    }
+                    self.speechModelDownloadTask = nil
+                }
             } catch {
-                self.statusMessage = nil
+                guard self.speechModelDownloadID == myDownloadID else { return }
+                if self.statusMessage?.hasPrefix("Downloading speech model") == true {
+                    self.statusMessage = nil
+                }
+                guard !Task.isCancelled else {
+                    self.speechModelDownloadTask = nil
+                    return
+                }
                 self.subtitleErrorMessage = "Couldn't download the speech model for \(name): \(error.localizedDescription)"
+                self.speechModelDownloadTask = nil
             }
         }
     }
@@ -267,6 +563,19 @@ final class PlayerViewModel: ObservableObject {
         playbackErrorMessage = nil
         statusMessage = nil // clear any status a superseded operation left behind
 
+        // Track lists belong to the previous file; repopulated when mpv
+        // reports the new file's streams (onTracksChanged).
+        audioTracks = []
+        subtitleTracks = []
+        currentAudioTrackID = 0
+        currentSubtitleTrackID = 0
+        colorInfo = nil
+        // Do not carry the previous file's PQ target/layer state into the new
+        // file while mpv is still discovering its colour metadata. This also
+        // handles audio-only files, which never publish video colour info.
+        _ = mpv.setHDRPassthrough(false)
+        hdrOutputActive = false
+
         // A new video invalidates any subtitles (and in-flight
         // transcription) generated for the previous one.
         subtitleGenerationTask?.cancel()
@@ -311,12 +620,51 @@ final class PlayerViewModel: ObservableObject {
         currentTime = seconds
     }
 
+    /// Relative seek used by the ←/→ keyboard shortcuts.
+    func step(by seconds: Double) {
+        guard duration > 0 else { return }
+        seek(toSeconds: min(max(0, currentTime + seconds), duration))
+    }
+
+    func adjustVolume(by delta: Double) {
+        volume = min(100, max(0, volume + delta))
+        if volume > 0, isMuted { isMuted = false }   // nudging volume unmutes
+    }
+
+    func toggleMute() {
+        isMuted.toggle()
+    }
+
+    // MARK: Track selection
+
+    /// Switch the active audio track (by mpv id from `audioTracks`).
+    func selectAudioTrack(_ id: Int64) {
+        mpv.setAudioTrack(id)
+        currentAudioTrackID = id
+    }
+
+    /// Zero-based position of the selected audio track among the file's
+    /// audio streams (container order — mpv lists them in that order, and
+    /// ffmpeg's `0:a:N` / AVFoundation's track array use the same order).
+    /// Used so subtitle generation and export operate on the *listened-to*
+    /// track, not blindly the first one.
+    var selectedAudioStreamIndex: Int {
+        audioTracks.firstIndex(where: { $0.id == currentAudioTrackID }) ?? 0
+    }
+
+    /// Switch the active embedded subtitle track, or pass 0 to turn them off.
+    func selectSubtitleTrack(_ id: Int64) {
+        mpv.setSubtitleTrack(id == 0 ? nil : id)
+        currentSubtitleTrackID = id
+    }
+
+
     // MARK: AI Subtitle Generator
 
     /// Transcribes the current video's audio in the background and
     /// populates `subtitleCues`. For containers the Speech framework can't
     /// read (MKV, WebM, ...), the audio track is extracted to a temporary
-    /// .m4a first via ffmpeg — fast, and the video itself is untouched.
+    /// 16 kHz WAV first via ffmpeg — fast, and the video itself is untouched.
     func generateSubtitles() {
         guard let url = currentVideoURL, !isGeneratingSubtitles else { return }
 
@@ -332,13 +680,16 @@ final class PlayerViewModel: ObservableObject {
 
         let locale = subtitleLanguage
         let totalDuration = duration
+        // Transcribe the track the user is actually listening to (Audio
+        // picker), not blindly the file's first audio stream.
+        let audioStreamIndex = selectedAudioStreamIndex
 
         subtitleGenerationTask = Task { @MainActor in
             guard self.subtitleGenerationID == myGeneration, !Task.isCancelled else { return }
             // Extraction (when needed) is roughly the first 15% of the
             // progress bar; transcription fills the rest.
             func extractAudio() async throws -> URL {
-                let audioURL = try await mediaImporter.extractAudio(from: url) { [weak self] progress in
+                let audioURL = try await mediaImporter.extractAudio(from: url, audioStreamIndex: audioStreamIndex) { [weak self] progress in
                     guard let self, self.subtitleGenerationID == myGeneration else { return }
                     self.subtitleGenerationProgress = progress * 0.15
                 }
@@ -368,7 +719,11 @@ final class PlayerViewModel: ObservableObject {
 
             do {
                 let cues: [SubtitleCue]
-                if MediaImporter.needsAudioExtraction(url) {
+                // The speech engines read via AVAudioFile, which can't open
+                // video containers (mp4/mov included) — only pure audio
+                // files. So extract audio first for anything that isn't
+                // already an audio file.
+                if !MediaImporter.isPureAudioFile(url) {
                     self.statusMessage = "Extracting audio track…"
                     let audioURL = try await extractAudio()
                     guard self.subtitleGenerationID == myGeneration else { return }
@@ -432,6 +787,10 @@ final class PlayerViewModel: ObservableObject {
     /// to preview the current engine settings quickly.
     func exportEnhancedVideo(durationLimit: Double? = nil) {
         guard let source = currentVideoURL, !isExportingVideo else { return }
+        guard colorInfo?.isHDR != true else {
+            playbackErrorMessage = "HDR export is not supported yet because the export pipeline is SDR-only. Playback HDR handling is unaffected."
+            return
+        }
 
         let panel = NSSavePanel()
         let baseName = (videoTitle as NSString).deletingPathExtension
@@ -457,18 +816,26 @@ final class PlayerViewModel: ObservableObject {
             playbackErrorMessage = "Choose a destination other than the source video."
             return
         }
+        // Recheck after the save panel closes: video metadata can finish
+        // loading while the panel is open.
+        guard colorInfo?.isHDR != true else {
+            playbackErrorMessage = "HDR export is not supported yet because the export pipeline is SDR-only. Playback HDR handling is unaffected."
+            return
+        }
         isExportingVideo = true
         exportProgress = 0
         playbackErrorMessage = nil
 
-        let configuration = VideoExporter.Configuration(
+        var configuration = VideoExporter.Configuration(
             superResolutionEnabled: superResolutionEnabled,
             upscaleFactor: upscaleFactor,
             frameInterpolationMultiplier: frameInterpolationMultiplier,
             imageEnhancementEnabled: imageEnhancementEnabled,
             enhancementEngine: enhancementEngine,
             enhancementStrength: enhancementStrength,
-            durationLimitSeconds: durationLimit
+            durationLimitSeconds: durationLimit,
+            // Export the audio track the user selected in the Audio picker.
+            audioTrackIndex: selectedAudioStreamIndex
         )
         let exporter = VideoExporter()
         videoExporter = exporter
@@ -478,29 +845,18 @@ final class PlayerViewModel: ObservableObject {
         // Free up decode/GPU bandwidth while exporting.
         if isPlaying { togglePlayPause() }
 
-        Task { @MainActor in
+        Task { @MainActor [self] in
             defer {
                 self.isExportingVideo = false
                 self.statusMessage = nil
                 self.videoExporter = nil
                 self.exportImporter = nil
             }
-            do {
-                var readableSource = source
-                // AVAssetReader can't open MKV/WebM/... — repackage first
-                // (stream copy where possible, so this is usually fast).
-                if MediaImporter.needsAudioExtraction(source) {
-                    self.statusMessage = "Repackaging video for export…"
-                    readableSource = try await importer.remuxVideoToMP4(from: source) { [weak self] progress in
-                        guard let self, self.isExportingVideo else { return }
-                        self.statusMessage = "Repackaging video for export… \(Int(progress * 100))%"
-                    }
-                }
-
+            func runExport(from readableSource: URL, using activeExporter: VideoExporter) async throws {
                 self.statusMessage = "Exporting video… 0.00% (interpolation makes this slower than real time)"
                 let exportStart = Date()
-                try await exporter.export(source: readableSource, to: destination,
-                                          configuration: configuration) { [weak self] progress in
+                try await activeExporter.export(source: readableSource, to: destination,
+                                                configuration: configuration) { [weak self] progress in
                     guard let self, self.isExportingVideo else { return }
                     self.exportProgress = progress
                     var text = String(format: "Exporting video… %.2f%%", progress * 100)
@@ -510,6 +866,45 @@ final class PlayerViewModel: ObservableObject {
                         text += String(format: " — about %.0f min left", max(remaining / 60, 1))
                     }
                     self.statusMessage = text
+                }
+            }
+
+            do {
+                var readableSource = source
+                // AVAssetReader can't open MKV/WebM/... — repackage first
+                // (stream copy where possible, so this is usually fast).
+                if MediaImporter.needsAudioExtraction(source) {
+                    self.statusMessage = "Repackaging video for export…"
+                    readableSource = try await importer.remuxVideoToMP4(
+                        from: source, audioStreamIndex: configuration.audioTrackIndex) { [weak self] progress in
+                        guard let self, self.isExportingVideo else { return }
+                        self.statusMessage = "Repackaging video for export… \(Int(progress * 100))%"
+                    }
+                    // The remuxed file carries only the selected track, so
+                    // downstream stages must read its (sole) first track.
+                    configuration.audioTrackIndex = 0
+                }
+
+                do {
+                    try await runExport(from: readableSource, using: exporter)
+                } catch let error as VideoExportError {
+                    // AVAssetReader can't decode some streams (e.g. 10-bit
+                    // HEVC) even from an .mp4. Our pipeline is 8-bit anyway,
+                    // so transcode to a baseline H.264 8-bit intermediate
+                    // and retry once.
+                    guard case .unreadableSource = error, MediaImporter.isFFmpegAvailable else { throw error }
+                    print("SuperResVideoPlayer: export reader failed (\(error.localizedDescription)); transcoding to a compatible format and retrying")
+                    self.statusMessage = "Preparing source for export…"
+                    let compatible = try await importer.transcodeForExport(
+                        from: readableSource, audioStreamIndex: configuration.audioTrackIndex) { [weak self] progress in
+                        guard let self, self.isExportingVideo else { return }
+                        self.statusMessage = "Preparing source for export… \(Int(progress * 100))%"
+                    }
+                    // Single audio track from here on (see remux above).
+                    configuration.audioTrackIndex = 0
+                    let retryExporter = VideoExporter()
+                    self.videoExporter = retryExporter
+                    try await runExport(from: compatible, using: retryExporter)
                 }
                 NSWorkspace.shared.activateFileViewerSelecting([destination])
             } catch {
@@ -525,10 +920,15 @@ final class PlayerViewModel: ObservableObject {
         exportImporter?.cancel()
     }
 
-    /// Returns the subtitle line that should be visible at `time`, if any
+    /// Returns the AI subtitle line that should be visible at `time`, if any
     /// (the translated line, when translation is active).
+    ///
+    /// Suppressed while an embedded subtitle track is active: mpv burns
+    /// those into the frame itself, so showing the AI overlay too would
+    /// stack two lines of text on top of each other. Selecting "Off" for the
+    /// embedded track brings the AI overlay straight back.
     func subtitleText(at time: Double) -> String? {
-        guard subtitlesEnabled else { return nil }
+        guard subtitlesEnabled, currentSubtitleTrackID == 0 else { return nil }
         if subtitleTimeline == nil {
             subtitleTimeline = SubtitleTimeline(cues: displayedSubtitleCues)
         }

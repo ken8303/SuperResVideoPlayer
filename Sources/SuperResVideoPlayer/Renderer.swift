@@ -3,6 +3,7 @@ import MetalKit
 import MetalFX
 import CoreVideo
 import QuartzCore
+import SuperResCore
 
 /// MTKView delegate that:
 ///  1. Pulls the current video frame from the libmpv engine (`MPVPlayer`)
@@ -27,6 +28,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: AI Image Enhancer (shared implementation with VideoExporter)
     private var enhancementProcessor: EnhancementProcessor?
+    /// Retained so the enhancer can be rebuilt if the pixel format changes.
+    private var shaderLibrary: MTLLibrary?
 
     private weak var playerViewModel: PlayerViewModel?
 
@@ -45,6 +48,15 @@ final class Renderer: NSObject, MTKViewDelegate {
         var enhancementUsesNeural = false
         var enhancementStrength: Double = 0.5
         var frameSource: MPVPlayer?
+        /// True while mpv is emitting PQ rather than SDR — MetalFX needs to
+        /// know, because its perceptual model assumes SDR-encoded input.
+        var hdrOutputActive = false
+        /// Pixel format of the frames mpv is producing. Carried in the
+        /// snapshot rather than read from the engine per draw: that read
+        /// takes the engine's state lock, which the render queue also holds
+        /// while publishing frames, so it put avoidable contention on the
+        /// hot path.
+        var sourcePixelFormat: MTLPixelFormat = PipelineFormat.metal
     }
     private let settingsLock = NSLock()
     private var _settings = RenderSettings()
@@ -61,7 +73,9 @@ final class Renderer: NSObject, MTKViewDelegate {
             // previews it with the MetalFX neural path.
             enhancementUsesNeural: viewModel.enhancementEngine != .classic,
             enhancementStrength: viewModel.enhancementStrength,
-            frameSource: viewModel.mpv
+            frameSource: viewModel.mpv,
+            hdrOutputActive: viewModel.hdrOutputActive,
+            sourcePixelFormat: viewModel.mpv.activeMetalFormat
         )
         settingsLock.lock()
         _settings = snapshot
@@ -80,10 +94,22 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var lastScalerInputSize: (width: Int, height: Int) = (0, 0)
     private var lastUpscaleFactor: Double = 0
     private var metalFXUpscaleSupported: Bool = true
+    /// Whether the live scaler was built for HDR input.
+    private var scalerConfiguredForHDR = false
+    /// Drawable format the current render pipeline state was built for. A
+    /// pipeline state whose colour attachment doesn't match the drawable
+    /// fails to encode.
+    private var drawablePixelFormat: MTLPixelFormat = PipelineFormat.drawable
+
+    /// Pixel format of the frames arriving from mpv (16-bit when this build
+    /// of libmpv accepts it, else 8-bit). Every texture the renderer creates
+    /// must match, or MetalFX and the compute kernels reject the mismatch.
+    /// Sampled per draw from the settings snapshot's frame source.
+    private var pipelinePixelFormat: MTLPixelFormat = PipelineFormat.metal
 
     // MARK: Frame Interpolation state
     private lazy var opticalFlow = OpticalFlowEstimator(device: device)
-    private lazy var frameInterpolator = FrameInterpolator(device: device)
+    private var frameInterpolator: FrameInterpolator
     private var warpOutputTexture: MTLTexture?
     private var lastWarpSize: (width: Int, height: Int) = (0, 0)
     private var metalFXInterpolationUsable = true
@@ -134,13 +160,46 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var statWarp = 0
     private var lastStatsPushTime = CACurrentMediaTime()
 
+    /// Tracks live renderer instances. Each owns Metal resources, a texture
+    /// cache and an optical-flow estimator, so more than one alive at a time
+    /// means SwiftUI is recreating the view and multiplying work.
+    private static let instanceLock = NSLock()
+    private static var activeInstanceCount = 0
+    private static var nextInstanceID = 0
+    private let instanceID: Int
+
+    private static func registerInstance() -> (id: Int, active: Int) {
+        instanceLock.lock()
+        defer { instanceLock.unlock() }
+        nextInstanceID += 1
+        activeInstanceCount += 1
+        return (nextInstanceID, activeInstanceCount)
+    }
+
+    private static func unregisterInstance() {
+        instanceLock.lock()
+        activeInstanceCount = max(0, activeInstanceCount - 1)
+        instanceLock.unlock()
+    }
+
+    /// Kept as a canary: more than one renderer means SwiftUI is rebuilding
+    /// the video view and multiplying Metal resources (see MetalVideoView's
+    /// RendererStore, which exists to prevent exactly that).
     init(device: MTLDevice, playerViewModel: PlayerViewModel) {
+        let registration = Self.registerInstance()
+        self.instanceID = registration.id
+        if registration.active > 1 {
+            print("SuperResVideoPlayer: WARNING — renderer #\(registration.id) created while \(registration.active - 1) other renderer(s) remain alive.")
+        }
         self.device = device
         self.playerViewModel = playerViewModel
         guard let queue = device.makeCommandQueue() else {
             fatalError("SuperResVideoPlayer: could not create a Metal command queue.")
         }
         self.commandQueue = queue
+        // Starts at the 16-bit format; draw(in:) rebuilds this and its
+        // dependents if mpv reports it fell back to 8-bit.
+        self.frameInterpolator = FrameInterpolator(device: device, pixelFormat: PipelineFormat.metal)
         super.init()
 
         let cacheStatus = CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
@@ -149,6 +208,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         buildPipelines()
         sync(with: playerViewModel) // initial snapshot (init runs on main)
+    }
+
+    deinit {
+        Self.unregisterInstance()
     }
 
     /// Loads the shader library, handling both build systems:
@@ -181,22 +244,9 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private func buildPipelines() {
         let library = Self.loadShaderLibrary(device: device)
+        self.shaderLibrary = library
 
-        guard let vertexFn = library.makeFunction(name: "videoVertexShader"),
-              let fragmentFn = library.makeFunction(name: "videoFragmentShader") else {
-            fatalError("SuperResVideoPlayer: missing shader functions in Shaders.metal.")
-        }
-
-        let descriptor = MTLRenderPipelineDescriptor()
-        descriptor.vertexFunction = vertexFn
-        descriptor.fragmentFunction = fragmentFn
-        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-
-        do {
-            pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
-        } catch {
-            fatalError("SuperResVideoPlayer: failed to build render pipeline state: \(error)")
-        }
+        buildRenderPipeline()
 
         guard let clearDepthFn = library.makeFunction(name: "clearDepthKernel"),
               let warpBlendFn = library.makeFunction(name: "warpBlendKernel") else {
@@ -210,7 +260,28 @@ final class Renderer: NSObject, MTKViewDelegate {
             fatalError("SuperResVideoPlayer: failed to build compute pipeline states: \(error)")
         }
 
-        enhancementProcessor = EnhancementProcessor(device: device, library: library)
+        enhancementProcessor = EnhancementProcessor(device: device, library: library,
+                                                   pixelFormat: pipelinePixelFormat)
+    }
+
+    /// Builds the render pipeline for `drawablePixelFormat`. Kept separate
+    /// from `buildPipelines()` so any future drawable-format change can rebuild
+    /// the colour attachment without recreating every compute pipeline.
+    private func buildRenderPipeline() {
+        guard let library = shaderLibrary,
+              let vertexFn = library.makeFunction(name: "videoVertexShader"),
+              let fragmentFn = library.makeFunction(name: "videoFragmentShader") else {
+            fatalError("SuperResVideoPlayer: missing shader functions in Shaders.metal.")
+        }
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFn
+        descriptor.fragmentFunction = fragmentFn
+        descriptor.colorAttachments[0].pixelFormat = drawablePixelFormat
+        do {
+            pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+        } catch {
+            fatalError("SuperResVideoPlayer: failed to build render pipeline state: \(error)")
+        }
     }
 
     // MARK: MTKViewDelegate
@@ -224,8 +295,55 @@ final class Renderer: NSObject, MTKViewDelegate {
         let settings = self.settings
         guard let source = settings.frameSource else { return }
 
+        // mpv can latch down to 8-bit if its build rejects the 16-bit
+        // format; rebuild dependent textures when that happens.
+        if settings.hdrOutputActive != scalerConfiguredForHDR {
+            processedFrame = nil
+            cachedInterpolation = nil
+            scalerConfiguredForHDR = settings.hdrOutputActive
+            spatialScaler = nil          // colour processing mode is baked in
+            scaledOutputTexture = nil
+            lastScalerInputSize = (0, 0)
+            // The Neural enhancer also owns a MetalFX scaler whose colour
+            // processing mode is baked into its descriptor.
+            if let library = shaderLibrary {
+                enhancementProcessor = EnhancementProcessor(
+                    device: device, library: library,
+                    pixelFormat: pipelinePixelFormat,
+                    hdrInput: settings.hdrOutputActive)
+            }
+        }
+
+        let sourceFormat = settings.sourcePixelFormat
+        if sourceFormat != pipelinePixelFormat {
+            processedFrame = nil
+            cachedInterpolation = nil
+            previousSample = nil
+            currentSample = nil
+            lastFrameSerial = 0
+            opticalFlow.reset()
+            pipelinePixelFormat = sourceFormat
+            spatialScaler = nil
+            scaledOutputTexture = nil
+            warpOutputTexture = nil
+            lastScalerInputSize = (0, 0)
+            lastWarpSize = (0, 0)
+            // These bake the format into their MetalFX descriptors.
+            frameInterpolator = FrameInterpolator(device: device, pixelFormat: sourceFormat)
+            if let library = shaderLibrary {
+                enhancementProcessor = EnhancementProcessor(device: device, library: library,
+                                                           pixelFormat: sourceFormat,
+                                                           hdrInput: settings.hdrOutputActive)
+            }
+        }
+
         updateFrameHistory(source: source,
                            interpolationEnabled: settings.frameInterpolationMultiplier > 1)
+
+        if view.colorPixelFormat != drawablePixelFormat {
+            drawablePixelFormat = view.colorPixelFormat
+            buildRenderPipeline()
+        }
 
         // Acquire presentation resources before encoding or caching GPU work.
         // Otherwise a missing drawable leaves cached textures uninitialized.
@@ -349,7 +467,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         if !loggedFirstFrame {
             loggedFirstFrame = true
-            print("SuperResVideoPlayer: first video frame received (\(texture.width)x\(texture.height))")
+            print("SuperResVideoPlayer: first video frame received (\(texture.width)x\(texture.height)) [renderer #\(instanceID)]")
         }
 
         let newSample = FrameSample(pixelBuffer: frame.pixelBuffer, texture: texture, cvTexture: wrapped.backing, itemTimeSeconds: frame.timeSeconds)
@@ -469,7 +587,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private func warpBlend(previous: MTLTexture, current: MTLTexture, motionTexture: MTLTexture, t: Double, commandBuffer: MTLCommandBuffer) -> MTLTexture? {
         if warpOutputTexture == nil || lastWarpSize.width != current.width || lastWarpSize.height != current.height {
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm, width: current.width, height: current.height, mipmapped: false
+                pixelFormat: pipelinePixelFormat, width: current.width, height: current.height, mipmapped: false
             )
             descriptor.usage = [.shaderRead, .shaderWrite]
             descriptor.storageMode = .private
@@ -513,7 +631,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             textureCache,
             pixelBuffer,
             nil,
-            .bgra8Unorm,
+            pipelinePixelFormat,
             width,
             height,
             0,
@@ -531,8 +649,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     private func upscale(_ input: MTLTexture, factor: Double, commandBuffer: MTLCommandBuffer) -> MTLTexture? {
         let inputWidth = input.width
         let inputHeight = input.height
-        let outputWidth = max(inputWidth, Int(Double(inputWidth) * factor))
-        let outputHeight = max(inputHeight, Int(Double(inputHeight) * factor))
+
+        // Clamp so the output stays within the GPU's texture-dimension limit
+        // (large/8K frames would otherwise exceed it and disable SR). Some
+        // upscaling beats none.
+        let effectiveFactor = VideoMath.clampedUpscaleFactor(
+            inputWidth: inputWidth, inputHeight: inputHeight, requestedFactor: factor)
+        // Already at/over the limit — nothing to upscale into; show native.
+        guard effectiveFactor > 1.01 else { return nil }
+
+        let outputSize = VideoMath.upscaledDimensions(
+            inputWidth: inputWidth,
+            inputHeight: inputHeight,
+            requestedFactor: effectiveFactor)
+        let outputWidth = outputSize.width
+        let outputHeight = outputSize.height
 
         let sizeChanged = lastScalerInputSize.width != inputWidth || lastScalerInputSize.height != inputHeight
         let factorChanged = lastUpscaleFactor != factor
@@ -565,9 +696,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         descriptor.inputHeight = inputHeight
         descriptor.outputWidth = outputWidth
         descriptor.outputHeight = outputHeight
-        descriptor.colorTextureFormat = .bgra8Unorm
-        descriptor.outputTextureFormat = .bgra8Unorm
-        descriptor.colorProcessingMode = .perceptual
+        descriptor.colorTextureFormat = pipelinePixelFormat
+        descriptor.outputTextureFormat = pipelinePixelFormat
+        // MetalFX's perceptual mode assumes an SDR-encoded signal; feeding
+        // it PQ that way crushes highlights. `.hdr` is the mode built for
+        // high dynamic range input.
+        descriptor.colorProcessingMode = scalerConfiguredForHDR ? .hdr : .perceptual
 
         guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
             print("SuperResVideoPlayer: MetalFX Spatial Scaler is not supported on this GPU. Falling back to native resolution.")
@@ -580,7 +714,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
+            pixelFormat: pipelinePixelFormat,
             width: outputWidth,
             height: outputHeight,
             mipmapped: false

@@ -21,11 +21,16 @@ real time:
 - **AI Frame Interpolation** — 2x/3x motion smoothing: Vision optical flow
   drives Apple's native **MTLFXFrameInterpolator** (2x midpoints) or a
   custom motion-compensated warp kernel (3x, and fallback).
-- **AI Subtitles** — on-device transcription with the macOS 26
-  **SpeechAnalyzer/SpeechTranscriber** API (long-form audio, per-word
-  timestamps), with legacy `SFSpeechRecognizer` as a fallback for extra
-  languages. Language models download on demand; installed ones show
-  "(downloaded)" in the picker.
+- **Audio & subtitle track selection** — multi-track files (MKVs with
+  several audio languages, commentary, or embedded subtitles) get pickers
+  in the controls bar, in the video's right-click menu, and in the **Video**
+  menu. The chosen audio track is what gets transcribed and exported, not
+  just what you hear.
+- **AI Subtitles** — on-device transcription with the
+  **SpeechAnalyzer/SpeechTranscriber** API introduced in macOS 26
+  (long-form audio, per-word timestamps), with legacy `SFSpeechRecognizer`
+  as a fallback for extra languages. Language models download on demand;
+  installed ones show "(downloaded)" in the picker.
 - **AI Subtitle Translation** — translate the generated subtitles (e.g.
   Japanese audio → Traditional Chinese subtitles) fully on-device with the
   **Apple Intelligence** foundation model (`FoundationModels` framework),
@@ -33,7 +38,7 @@ real time:
   profile suited to translating existing media.
 - **Enhanced video export** — re-render the whole file offline with Super
   Resolution and frame interpolation applied, encoded to HEVC `.mp4` with
-  audio passed through. Unlike playback (which skips interpolation when
+  audio re-encoded to AAC. Unlike playback (which skips interpolation when
   optical flow can't keep up in real time), export computes flow for every
   frame pair.
 - **.srt export** of the generated (or translated) subtitles.
@@ -41,17 +46,38 @@ real time:
   synthesized frames per second, which interpolation engine is active) so
   you can verify the enhancements are actually running.
 
+## Download
+
+Grab the latest `SuperResVideoPlayer.zip` from the
+[Releases page](../../releases/latest) — the app is self-contained, so
+there's nothing else to install.
+
+1. Unzip and drag the app to Applications.
+2. **Right-click → Open** the first time (the build is ad-hoc signed, not
+   notarized, so a plain double-click is blocked once).
+3. If macOS says the app is damaged:
+   `xattr -dc /Applications/SuperResVideoPlayer.app`
+
+Needs an Apple Silicon Mac on macOS 26 or later. Everything below is for building
+from source instead.
+
 ## Requirements
 
 - Apple Silicon Mac (MetalFX requires an Apple-family GPU).
-- **macOS 26 "Tahoe" or later** — hard floor for `MTLFXFrameInterpolator`
-  (Metal 4) and the SpeechAnalyzer API.
-- Xcode 26+ / a Swift 6.2+ toolchain to build.
+- **macOS 26 or later.** That's the real floor: the newest frameworks used
+  here — `MTLFXFrameInterpolator` (Metal 4), SpeechAnalyzer, Foundation
+  Models — all shipped in macOS 26. macOS 27 is still worth having for its
+  improved on-device translation model, but nothing requires it.
+- Xcode 27+ / a Swift 6.2+ toolchain to build.
 - **libmpv**: `brew install mpv`
-- Optional: `brew install ffmpeg` — used only to extract audio for subtitle
-  generation from containers Apple's Speech framework can't read (MKV,
-  WebM, ...), and to repackage such containers for export. Playback itself
-  never needs it.
+- **ffmpeg**: `brew install ffmpeg` — required for *subtitle generation on
+  video files* (the speech engines read via `AVAudioFile`, which can't
+  demux video containers, so the audio track is extracted to a temporary
+  16 kHz WAV first), and for exporting containers `AVAssetReader` can't
+  read (MKV/WebM) or decode (10-bit HEVC).
+  **Not** needed for playback, Super Resolution, frame interpolation, the
+  image enhancer, or subtitle translation. In practice `brew install mpv`
+  already pulls ffmpeg in as a dependency.
 - Subtitle translation requires **Apple Intelligence** to be enabled
   (System Settings > Apple Intelligence & Siri).
 - The **Max** image-enhancer engine requires the Real-ESRGAN Core ML model.
@@ -79,14 +105,14 @@ tree bundled into `Contents/Frameworks`, ffmpeg/ffprobe into
 bash make-dist.sh   # → dist/SuperResVideoPlayer.app + dist/SuperResVideoPlayer.zip
 ```
 
-Recipients need Apple Silicon + macOS 26, and must right-click > Open on
+Recipients need Apple Silicon + macOS 26 or later, and must right-click > Open on
 first launch (the app is ad-hoc signed, not notarized).
 
 ## How it works
 
 ```
 libmpv (demux + decode + audio + A/V sync)
-   └─ software render API → BGRA CVPixelBuffer   (MPVPlayer.swift, dedicated queue)
+   └─ software render API → 16-bit RGBA CVPixelBuffer (MPVPlayer.swift, dedicated queue)
         └─ zero-copy Metal texture wrap           (Renderer.swift, MTKView draw loop)
              ├─ AI Frame Interpolation            (Vision optical flow → MetalFX / warp kernel)
              ├─ MetalFX Super Resolution          (spatial scaler)
@@ -105,9 +131,9 @@ libmpv (demux + decode + audio + A/V sync)
   kernel otherwise), then optionally upscales. Synthesized frames are
   cached per (pair, phase) so 120Hz refresh doesn't re-encode identical
   work.
-- Subtitles: audio is transcribed on-device (extracted to a temp `.m4a`
-  first when the container needs it); word timings are grouped into cues by
-  a pause/length heuristic (CJK-aware). Translation rewrites cue text in
+- Subtitles: audio is transcribed on-device (extracted first to a temp
+  16 kHz mono WAV — the selected audio track, not blindly the first); word
+  timings are grouped into cues by a pause/length heuristic (CJK-aware). Translation rewrites cue text in
   batches of 15 through the on-device language model, with per-line retry
   when a batch is rejected or garbled.
 - Export: `AVAssetReader` → the same Metal pipeline (flow computed per
@@ -122,16 +148,19 @@ libmpv (demux + decode + audio + A/V sync)
   ghosting around fast/complex motion, especially at 3x. During playback,
   interpolation only engages when Vision keeps up in real time — the stats
   line shows the live synth rate; export always interpolates every pair.
-- Export preserves rotation metadata, including after upscaling, but still
-  uses an 8-bit SDR pipeline and does not preserve HDR color metadata.
+- Export preserves rotation metadata, including after upscaling. Its working
+  format remains 8-bit SDR; HDR export is blocked until color-managed
+  tone mapping is available.
 - The cue-grouping heuristic is pause/length-based, not linguistic; breaks
   won't always land on natural phrase boundaries.
 - Subtitle translation quality is "on-device LLM" grade — good for
   following along, not fansub grade. A few lines may be skipped by the
   model's content filter (they keep the original text; the UI reports how
   many).
-- The video render path is 8-bit BGRA without color management; HDR
-  sources are tone-mapped by mpv to SDR.
+- The video render path is 16-bit RGBA. HDR10/HLG sources are passed
+  through as PQ to a display with extended dynamic range, and tone-mapped
+  (BT.2390) otherwise — including on "HDR ready" monitors whose actual peak
+  brightness is around SDR levels, where passthrough would just clip.
 
 ## File map
 
@@ -164,10 +193,16 @@ Sources/SuperResVideoPlayer/
 
 ## Licenses
 
-The source in this repository is the author's. Binary distributions built
-with `make-dist.sh` bundle [mpv/libmpv](https://mpv.io) and
+SuperResVideoPlayer is free and open-source software licensed under the
+[GNU General Public License v3.0 or later](LICENSE). You may use, study,
+modify, and redistribute it under those terms.
+
+Binary distributions built with `make-dist.sh` bundle [mpv/libmpv](https://mpv.io) and
 [FFmpeg](https://ffmpeg.org) (Homebrew builds, GPL-enabled) — if you
 redistribute the bundled app, GPL obligations apply to those components.
+The package includes their primary license texts and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). A public binary release
+must also provide matching corresponding source.
 
 The **Max** engine uses the [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
 `realesr-animevideov3` model (BSD-3-Clause, Xintao Wang et al.). The model

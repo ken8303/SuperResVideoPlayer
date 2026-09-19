@@ -1,3 +1,4 @@
+import SuperResCore
 import Foundation
 
 /// Indexed lookup preserves the first active cue even when padded cues overlap.

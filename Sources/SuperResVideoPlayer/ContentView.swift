@@ -1,36 +1,72 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @StateObject private var playerViewModel = PlayerViewModel()
+    /// Owned by the App scene so the menu-bar commands can drive playback
+    /// with keyboard shortcuts.
+    @ObservedObject var playerViewModel: PlayerViewModel
+
+    /// Highlights the video area while a file is dragged over it.
+    @State private var isDropTargeted = false
+
+    // Auto-hiding controls (full screen only).
+    @State private var isFullScreen = false
+    @State private var controlsVisible = true
+    @State private var hideControlsTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(spacing: 0) {
-            ZStack(alignment: .bottom) {
-                MetalVideoView(playerViewModel: playerViewModel)
-                    .background(Color.black)
-
-                if let text = playerViewModel.subtitleText(at: playerViewModel.currentTime) {
-                    Text(text)
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
-                        .padding(.bottom, 24)
-                        .padding(.horizontal, 40)
-                        .shadow(radius: 2)
-                        .allowsHitTesting(false)
+        // One structure for both layouts, on purpose.
+        //
+        // This used to be `if isFullScreen { ZStack } else { VStack }`, which
+        // SwiftUI treats as two unrelated view trees: toggling full screen
+        // tore down the whole video subtree and built a fresh MTKView. That
+        // meant a visible reset on every transition, the display layer losing
+        // its colour-space tag, and (before RendererStore) a duplicated set
+        // of Metal resources.
+        //
+        // Keeping `videoArea` as the first child of the same VStack inside
+        // the same ZStack preserves its identity, so the transition only
+        // changes where the controls sit — not what the video view *is*.
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 0) {
+                videoArea
+                // In full screen the bar is overlaid instead, so it can fade
+                // out and leave full-frame video.
+                if !isFullScreen {
+                    controlsBar
                 }
             }
-            .frame(minWidth: 640, minHeight: 360)
-
-            controls
-                .padding()
-                .background(.regularMaterial)
+            if isFullScreen {
+                controlsBar
+                    .opacity(controlsVisible ? 1 : 0)
+                    .allowsHitTesting(controlsVisible)
+            }
         }
-        .frame(minWidth: 720, minHeight: 480)
+        .frame(minWidth: isFullScreen ? nil : 720,
+               // Keep every desktop control visible. When space gets tight,
+               // the flexible video area shrinks to its 360-point minimum;
+               // the settings panel itself is never clipped or scrolled.
+               minHeight: isFullScreen ? nil : 860)
         .navigationTitle(playerViewModel.videoTitle)
+        // Opening a video from Finder ("Open With", or dropping it on the
+        // Dock icon) delivers the file here — without this the app would
+        // launch but never load the file, since Info.plist advertises
+        // CFBundleDocumentTypes.
+        .onOpenURL { url in
+            guard url.isFileURL else { return }
+            playerViewModel.load(url: url)
+        }
+        // Track full-screen state so the layout and auto-hide follow it.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            isFullScreen = true
+            showControlsTemporarily()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            isFullScreen = false
+            hideControlsTask?.cancel()
+            controlsVisible = true
+        }
         .onChange(of: playerViewModel.translationTargetIdentifier) { _, _ in
             playerViewModel.startSubtitleTranslation()
         }
@@ -42,6 +78,85 @@ struct ContentView: View {
         .onChange(of: playerViewModel.subtitleCues) { _, _ in
             // Newly generated cues: retranslate if a target is active.
             playerViewModel.startSubtitleTranslation()
+        }
+    }
+
+    private var videoArea: some View {
+        ZStack(alignment: .bottom) {
+            MetalVideoView(playerViewModel: playerViewModel)
+                .background(Color.black)
+                .overlay {
+                    if isDropTargeted {
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(Color.accentColor, lineWidth: 4)
+                            .background(Color.accentColor.opacity(0.12))
+                            .allowsHitTesting(false)
+                    }
+                }
+
+            SubtitleOverlayView(
+                viewModel: playerViewModel,
+                bottomPadding: isFullScreen && controlsVisible ? 140 : 24)
+        }
+        .frame(minWidth: 640, minHeight: 360)
+        // Right-click the picture for the full settings menu — the only
+        // always-reachable settings surface in full screen once the
+        // controls bar has auto-hidden.
+        .contextMenu {
+            SettingsMenuContent(viewModel: playerViewModel)
+        }
+        // Any mouse movement over the picture reveals the controls again.
+        .onContinuousHover { phase in
+            if case .active = phase { showControlsTemporarily() }
+        }
+        // Drag a video file straight onto the picture to open it.
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                Task { @MainActor in
+                    playerViewModel.load(url: url)
+                }
+            }
+            return true
+        }
+    }
+
+    private var controlsBar: some View {
+        controls
+            .frame(maxWidth: .infinity)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding()
+            .background(.regularMaterial)
+            // Keep the bar alive while the pointer is over it — otherwise
+            // the auto-hide timer fires mid-interaction (e.g. while dragging
+            // the volume slider in full screen) and the controls vanish.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active:
+                    hideControlsTask?.cancel()
+                    if !controlsVisible {
+                        withAnimation(.easeOut(duration: 0.2)) { controlsVisible = true }
+                    }
+                case .ended:
+                    showControlsTemporarily()   // restart the countdown on exit
+                }
+            }
+    }
+
+    /// Shows the controls and (in full screen) schedules them to fade out
+    /// after a few seconds of no mouse movement.
+    private func showControlsTemporarily() {
+        hideControlsTask?.cancel()
+        if !controlsVisible {
+            withAnimation(.easeOut(duration: 0.2)) { controlsVisible = true }
+        }
+        guard isFullScreen else { return }
+        hideControlsTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, isFullScreen else { return }
+            withAnimation(.easeOut(duration: 0.4)) { controlsVisible = false }
+            NSCursor.setHiddenUntilMouseMoves(true)
         }
     }
 
@@ -81,32 +196,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            HStack {
-                Button {
-                    playerViewModel.togglePlayPause()
-                } label: {
-                    Image(systemName: playerViewModel.isPlaying ? "pause.fill" : "play.fill")
-                        .frame(width: 24)
-                }
-                .disabled(playerViewModel.duration == 0)
-
-                Slider(
-                    value: Binding(
-                        get: { playerViewModel.currentTime },
-                        set: { playerViewModel.seek(toSeconds: $0) }
-                    ),
-                    in: 0...max(playerViewModel.duration, 0.01),
-                    onEditingChanged: { editing in
-                        playerViewModel.isScrubbing = editing
-                    }
-                )
-                .disabled(playerViewModel.duration == 0)
-
-                Text(timeString(playerViewModel.currentTime) + " / " + timeString(playerViewModel.duration))
-                    .font(.caption)
-                    .monospacedDigit()
-                    .frame(minWidth: 100, alignment: .trailing)
-            }
+            PlaybackTransportView(viewModel: playerViewModel)
 
             Divider()
 
@@ -137,7 +227,7 @@ struct ContentView: View {
             if playerViewModel.imageEnhancementEnabled && playerViewModel.enhancementEngine == .max {
                 Text(NeuralEnhancer.isModelAvailable
                      ? "Max (Real-ESRGAN) applies during export — playback previews with the Neural engine."
-                     : "Max needs the Real-ESRGAN model: run `bash convert-model.sh` once to install it.")
+                     : "Max needs an optional Real-ESRGAN model that isn't installed. Use Classic or Neural, which need nothing extra.")
                     .font(.caption)
                     .foregroundStyle(NeuralEnhancer.isModelAvailable ? Color.secondary : Color.orange)
             }
@@ -191,11 +281,73 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            // Say whether HDR is reaching the display or being tone-mapped,
+            // rather than silently changing how the source looks.
+            if let notice = playerViewModel.hdrNotice {
+                Label(notice, systemImage: "sun.max")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help("HDR uses the 16-bit playback pipeline when supported. On displays without extended range—or if libmpv falls back to 8-bit—the source is tone-mapped with BT.2390 and per-scene peak detection.")
+            }
+
+            // Audio-track / embedded-subtitle pickers appear only when the
+            // file actually offers a choice (multi-language MKV, etc.).
+            if playerViewModel.audioTracks.count > 1 || !playerViewModel.subtitleTracks.isEmpty {
+                Divider()
+                trackControls
+            }
+
             Divider()
 
             subtitleControls
         }
     }
+
+    /// Selectors for the container's own audio tracks and embedded subtitle
+    /// tracks — distinct from the AI subtitle generator below.
+    private var trackControls: some View {
+        HStack {
+            if playerViewModel.audioTracks.count > 1 {
+                Text("Audio")
+                    .foregroundStyle(.secondary)
+                Picker("Audio", selection: Binding(
+                    get: { playerViewModel.currentAudioTrackID },
+                    set: { playerViewModel.selectAudioTrack($0) }
+                )) {
+                    ForEach(playerViewModel.audioTracks) { track in
+                        Text(trackLabel(for: track)).tag(track.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 200)
+            }
+
+            Spacer()
+
+            if !playerViewModel.subtitleTracks.isEmpty {
+                Text("Subtitle Track")
+                    .foregroundStyle(.secondary)
+                Picker("Subtitle Track", selection: Binding(
+                    get: { playerViewModel.currentSubtitleTrackID },
+                    set: { playerViewModel.selectSubtitleTrack($0) }
+                )) {
+                    Text("Off").tag(Int64(0))
+                    ForEach(playerViewModel.subtitleTracks) { track in
+                        Text(trackLabel(for: track)).tag(track.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 200)
+                .help("Subtitles embedded in the file, rendered by the player — separate from AI-generated subtitles below.")
+            }
+        }
+    }
+
+    private func trackLabel(for track: MPVPlayer.Track) -> String {
+        videoTrackLabel(for: track)
+    }
+
 
     private var subtitleControls: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -286,18 +438,128 @@ struct ContentView: View {
         return installed ? "\(name) (downloaded)" : name
     }
 
-    private func timeString(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
-        let total = Int(seconds)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        return h > 0
-            ? String(format: "%d:%02d:%02d", h, m, s)
-            : String(format: "%d:%02d", m, s)
+}
+
+/// Human-readable label for an audio/subtitle track: title and/or language,
+/// falling back to the track number, with a default marker. Shared by the
+/// controls-bar pickers, the video context menu, and the Video menu.
+func videoTrackLabel(for track: MPVPlayer.Track) -> String {
+    var parts: [String] = []
+    if let title = track.title, !title.isEmpty { parts.append(title) }
+    if let lang = track.lang, !lang.isEmpty { parts.append("(\(lang))") }
+    if parts.isEmpty { parts.append("Track \(track.id)") }
+    var label = parts.joined(separator: " ")
+    if track.isDefault { label += " — default" }
+    return label
+}
+
+/// The player's settings, as menu items. Used in two places so settings stay
+/// reachable everywhere: the right-click context menu on the video (works in
+/// full screen after the controls auto-hide) and the "Video" menu in the
+/// menu bar. Pickers render as submenus with checkmarks; Toggles as
+/// checkmarked items.
+///
+/// IMPORTANT: this view must not observe `PlayerViewModel` directly.
+/// Unrelated state such as pipeline statistics changes during playback, and
+/// every publish would rebuild the open NSMenu — making it flash and
+/// difficult to interact with. Instead it observes `viewModel.menuState`,
+/// which fires only when a value these menus actually display changes; the
+/// view model is held as a plain reference and all bindings are built by hand.
+struct SettingsMenuContent: View {
+    let viewModel: PlayerViewModel
+    @ObservedObject private var menuState: PlayerViewModel.MenuState
+
+    init(viewModel: PlayerViewModel) {
+        self.viewModel = viewModel
+        self.menuState = viewModel.menuState
+    }
+
+    var body: some View {
+        // --- Container streams -------------------------------------------
+        if viewModel.audioTracks.count > 1 {
+            Picker("Audio Track", selection: Binding(
+                get: { viewModel.currentAudioTrackID },
+                set: { viewModel.selectAudioTrack($0) }
+            )) {
+                ForEach(viewModel.audioTracks) { track in
+                    Text(videoTrackLabel(for: track)).tag(track.id)
+                }
+            }
+        }
+        if !viewModel.subtitleTracks.isEmpty {
+            Picker("Subtitle Track", selection: Binding(
+                get: { viewModel.currentSubtitleTrackID },
+                set: { viewModel.selectSubtitleTrack($0) }
+            )) {
+                Text("Off").tag(Int64(0))
+                ForEach(viewModel.subtitleTracks) { track in
+                    Text(videoTrackLabel(for: track)).tag(track.id)
+                }
+            }
+        }
+        if viewModel.audioTracks.count > 1 || !viewModel.subtitleTracks.isEmpty {
+            Divider()
+        }
+
+        // --- Enhancement pipeline ----------------------------------------
+        Toggle("AI Image Enhancer", isOn: Binding(
+            get: { viewModel.imageEnhancementEnabled },
+            set: { viewModel.imageEnhancementEnabled = $0 }
+        ))
+        Picker("Enhancer Engine", selection: Binding(
+            get: { viewModel.enhancementEngine },
+            set: { viewModel.enhancementEngine = $0 }
+        )) {
+            Text("Classic").tag(EnhancerEngine.classic)
+            Text("Neural").tag(EnhancerEngine.neural)
+            Text("Max").tag(EnhancerEngine.max)
+        }
+        .disabled(!viewModel.imageEnhancementEnabled)
+
+        Toggle("Super Resolution", isOn: Binding(
+            get: { viewModel.superResolutionEnabled },
+            set: { viewModel.superResolutionEnabled = $0 }
+        ))
+        Picker("Upscale Factor", selection: Binding(
+            get: { viewModel.upscaleFactor },
+            set: { viewModel.upscaleFactor = $0 }
+        )) {
+            Text("1.3x").tag(1.3)
+            Text("1.5x").tag(1.5)
+            Text("2.0x").tag(2.0)
+        }
+        .disabled(!viewModel.superResolutionEnabled)
+
+        Picker("AI Frame Interpolation", selection: Binding(
+            get: { viewModel.frameInterpolationMultiplier },
+            set: { viewModel.frameInterpolationMultiplier = $0 }
+        )) {
+            Text("Off").tag(1)
+            Text("2x").tag(2)
+            Text("3x").tag(3)
+        }
+
+        Divider()
+
+        // --- AI subtitles -------------------------------------------------
+        Toggle("AI Subtitles", isOn: Binding(
+            get: { viewModel.subtitlesEnabled },
+            set: { viewModel.subtitlesEnabled = $0 }
+        ))
+        .disabled(viewModel.subtitleCues.isEmpty)
+        if viewModel.isGeneratingSubtitles {
+            Button("Cancel Subtitle Generation") {
+                viewModel.cancelSubtitleGeneration()
+            }
+        } else {
+            Button("Generate Subtitles") {
+                viewModel.generateSubtitles()
+            }
+            .disabled(viewModel.duration == 0)
+        }
     }
 }
 
 #Preview {
-    ContentView()
+    ContentView(playerViewModel: PlayerViewModel())
 }

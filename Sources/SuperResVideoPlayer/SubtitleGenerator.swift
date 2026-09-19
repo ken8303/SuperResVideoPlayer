@@ -1,11 +1,17 @@
-import Speech
+// Speech's Objective-C request types have not adopted Sendable annotations,
+// although their asynchronous request API is designed to be fed from a
+// worker queue. Import with pre-concurrency semantics until Apple annotates
+// the framework.
+@preconcurrency import Speech
 import AVFoundation
 import Foundation
+import SuperResCore
 
 enum SubtitleGenerationError: LocalizedError {
     case authorizationDenied
     case recognizerUnavailable
     case recognitionFailed(Error)
+    case legacyDurationLimit
 
     var errorDescription: String? {
         switch self {
@@ -15,6 +21,8 @@ enum SubtitleGenerationError: LocalizedError {
             return "Speech recognition isn't available for the selected language on this Mac."
         case .recognitionFailed(let error):
             return "Transcription failed: \(error.localizedDescription)"
+        case .legacyDurationLimit:
+            return "This language uses the older speech engine on this Mac, which can only transcribe clips under a minute. Pick a language supported by the on-device model, or use a shorter clip."
         }
     }
 }
@@ -33,12 +41,20 @@ enum SubtitleGenerationError: LocalizedError {
 ///     so it's only used when there's no alternative.
 final class SubtitleGenerator {
 
-    /// One transcribed word with its position in the audio timeline —
-    /// the common currency both engines are reduced to.
-    struct WordTiming {
-        let text: String
-        let start: TimeInterval
-        let end: TimeInterval
+    /// Narrow bridge from the GCD audio-feeder closure back to the generator.
+    /// Swift weak references are thread-safe; the generator's continuation is
+    /// itself protected by `continuationLock`.
+    private final class LegacyReadFailureHandler: @unchecked Sendable {
+        weak var generator: SubtitleGenerator?
+
+        init(generator: SubtitleGenerator) {
+            self.generator = generator
+        }
+
+        func report(_ error: Error) {
+            generator?.resumePending(
+                throwing: SubtitleGenerationError.recognitionFailed(error))
+        }
     }
 
     /// Requests Speech Recognition authorization if not already granted
@@ -257,7 +273,9 @@ final class SubtitleGenerator {
         analysisFinished = true
         try checkCancellation()
 
-        return Self.buildCues(from: words, joiningWith: Self.wordSeparator(for: locale))
+        return SubtitleGrouping.buildCues(
+            from: words,
+            joiningWith: SubtitleGrouping.wordSeparator(forLanguageCode: locale.identifier))
     }
 
     // MARK: Legacy engine (SFSpeechRecognizer)
@@ -273,18 +291,39 @@ final class SubtitleGenerator {
             throw SubtitleGenerationError.recognizerUnavailable
         }
 
+        // SFSpeechRecognizer caps on-device recognition at ~1 minute of
+        // audio; beyond that it silently truncates. Fail clearly instead of
+        // returning subtitles that only cover the first minute. (60s minus a
+        // safety margin; totalDuration == 0 means unknown, so allow it.)
+        if totalDuration > 58 {
+            throw SubtitleGenerationError.legacyDurationLimit
+        }
+
         guard await Self.requestAuthorizationIfNeeded() else {
             throw SubtitleGenerationError.authorizationDenied
         }
 
         try checkCancellation()
-        let request = SFSpeechURLRecognitionRequest(url: url)
+        // Read the audio ourselves and stream PCM buffers into Speech via
+        // SFSpeechAudioBufferRecognitionRequest, instead of the file-based
+        // SFSpeechURLRecognitionRequest. The URL request builds an internal
+        // AVAssetReaderAudioMixOutput that throws an *uncatchable* ObjC
+        // exception on macOS 27 beta for some inputs (crashing the app). The
+        // buffer request never touches that code path.
+        let audioFile: AVAudioFile
+        do {
+            audioFile = try AVAudioFile(forReading: url)
+        } catch {
+            throw SubtitleGenerationError.recognitionFailed(error)
+        }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
 
-        let separator = Self.wordSeparator(for: locale)
+        let separator = SubtitleGrouping.wordSeparator(forLanguageCode: locale.identifier)
 
         return try await withCheckedThrowingContinuation { continuation in
             continuationLock.lock()
@@ -322,7 +361,7 @@ final class SubtitleGenerator {
                     let words = result.bestTranscription.segments.map {
                         WordTiming(text: $0.substring, start: $0.timestamp, end: $0.timestamp + $0.duration)
                     }
-                    self.resumePending(returning: Self.buildCues(from: words, joiningWith: separator))
+                    self.resumePending(returning: SubtitleGrouping.buildCues(from: words, joiningWith: separator))
                 }
             }
             continuationLock.lock()
@@ -330,6 +369,27 @@ final class SubtitleGenerator {
             if !cancelled { task = recognitionTask }
             continuationLock.unlock()
             if cancelled { recognitionTask.cancel() }
+
+            // Stream the whole file into the recognizer in PCM chunks.
+            let readFailureHandler = LegacyReadFailureHandler(generator: self)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let format = audioFile.processingFormat
+                let chunkFrames: AVAudioFrameCount = 16384
+                do {
+                    while true {
+                        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
+                        try audioFile.read(into: buffer)
+                        if buffer.frameLength == 0 { break }  // EOF
+                        request.append(buffer)
+                    }
+                } catch {
+                    print("SuperResVideoPlayer: legacy audio read failed: \(error)")
+                    request.endAudio()
+                    readFailureHandler.report(error)
+                    return
+                }
+                request.endAudio()
+            }
         }
     }
 
@@ -351,54 +411,4 @@ final class SubtitleGenerator {
         continuation?.resume(throwing: error)
     }
 
-    // MARK: Cue building
-
-    /// CJK-family languages aren't space-delimited — joining their "words"
-    /// with spaces produces unnatural subtitles.
-    private static func wordSeparator(for locale: Locale) -> String {
-        let language = locale.identifier.prefix(2).lowercased()
-        return ["zh", "ja", "th"].contains(language) ? "" : " "
-    }
-
-    /// Groups word-level timings into readable subtitle cues. A new cue
-    /// starts after a pause longer than `pauseThreshold`, once the cue
-    /// would exceed the character budget (~two subtitle lines; halved for
-    /// CJK since those glyphs are double-width), or once it would span more
-    /// than `maxCueDuration` seconds. A simple heuristic, not a sentence
-    /// segmenter — cue breaks won't always land on natural boundaries.
-    private static func buildCues(from words: [WordTiming], joiningWith separator: String) -> [SubtitleCue] {
-        guard !words.isEmpty else { return [] }
-
-        let maxCueDuration: TimeInterval = 6.0
-        let maxCueChars = separator.isEmpty ? 32 : 84
-        let pauseThreshold: TimeInterval = 0.35
-        let trailingPadding: TimeInterval = 0.15
-
-        var cues: [SubtitleCue] = []
-        var currentWords: [WordTiming] = []
-
-        func flush() {
-            guard let first = currentWords.first, let last = currentWords.last else { return }
-            let text = currentWords.map(\.text).joined(separator: separator)
-            cues.append(SubtitleCue(startTime: first.start, endTime: last.end + trailingPadding, text: text))
-            currentWords.removeAll()
-        }
-
-        for word in words {
-            if let last = currentWords.last, let first = currentWords.first {
-                let gap = word.start - last.end
-                let projectedChars = (currentWords.map(\.text) + [word.text])
-                    .joined(separator: separator).count
-                let projectedDuration = word.end - first.start
-
-                if gap > pauseThreshold || projectedChars > maxCueChars || projectedDuration > maxCueDuration {
-                    flush()
-                }
-            }
-            currentWords.append(word)
-        }
-        flush()
-
-        return cues
-    }
 }

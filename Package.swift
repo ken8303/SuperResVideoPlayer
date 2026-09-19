@@ -1,5 +1,6 @@
-// swift-tools-version:6.2
-// (6.2+ is required for PackageDescription to expose `.macOS(.v26)` below.)
+// swift-tools-version:6.4
+// (ships with the Xcode 27 toolchain, which is what this is built with —
+// the deployment target below is deliberately lower, see `platforms`.)
 import PackageDescription
 import Foundation
 
@@ -15,14 +16,15 @@ let infoPlistPath = URL(fileURLWithPath: #filePath)
 let package = Package(
     name: "SuperResVideoPlayer",
     platforms: [
-        // MetalFX Frame Interpolation (MTLFXFrameInterpolator, part of
-        // Metal 4) requires macOS 26+. The Super Resolution spatial scaler
-        // alone only needs macOS 13/14, but since this target now also uses
-        // frame interpolation, the whole app needs macOS 26 as its floor.
-        // If `.v26` isn't recognized, your installed Swift toolchain
-        // predates macOS 26 SDK support — install Xcode 26+ or a matching
-        // toolchain, or bump swift-tools-version above if Apple ships a
-        // newer PackageDescription API for it.
+        // macOS 26 is the real floor: every framework this app depends on
+        // that isn't long-standing arrived in 26 — MTLFXFrameInterpolator
+        // (Metal 4) for frame interpolation, SpeechAnalyzer for subtitles,
+        // and FoundationModels for translation. Nothing here needs 27; that
+        // only ships a better on-device translation *model*, which is a
+        // quality difference rather than an API requirement.
+        //
+        // Still built with the Xcode 27 toolchain against the 27 SDK — the
+        // deployment target is what decides which systems can run it.
         .macOS(.v26)
     ],
     targets: [
@@ -37,9 +39,23 @@ let package = Package(
             pkgConfig: "mpv",
             providers: [.brew(["mpv"])]
         ),
+        // Dependency-free library holding the pure logic (subtitle grouping,
+        // .srt formatting, translation parsing, media classification) so it
+        // can be unit-tested without AVFoundation/Speech/Metal.
+        .target(
+            name: "SuperResCore",
+            path: "Sources/SuperResCore",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "SuperResCoreTests",
+            dependencies: ["SuperResCore"],
+            path: "Tests/SuperResCoreTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         .executableTarget(
             name: "SuperResVideoPlayer",
-            dependencies: ["Cmpv"],
+            dependencies: ["Cmpv", "SuperResCore"],
             path: "Sources/SuperResVideoPlayer",
             resources: [
                 // Ship the raw shader source in the module's resource
@@ -93,7 +109,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SuperResVideoPlayerTests",
-            dependencies: ["SuperResVideoPlayer"],
+            dependencies: ["SuperResVideoPlayer", "SuperResCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]

@@ -1,6 +1,5 @@
 import Metal
 import MetalFX
-import MetalPerformanceShaders
 
 /// The "AI Image Enhancer": cleans and sharpens a frame **without changing
 /// its resolution**. Two engines:
@@ -23,9 +22,15 @@ final class EnhancementProcessor {
     }
 
     private let device: MTLDevice
+    /// Pixel format of the textures flowing through this processor. Defaults
+    /// to 8-bit for the export path; playback passes its 16-bit format.
+    private let pixelFormat: MTLPixelFormat
+    /// MetalFX must interpret PQ/HLG input as HDR; perceptual mode assumes
+    /// SDR-encoded values and visibly compresses highlights.
+    private let hdrInput: Bool
     private let enhancePipeline: MTLComputePipelineState
     private let blendPipeline: MTLComputePipelineState
-    private let lanczos: MPSImageLanczosScale
+    private let downsamplePipeline: MTLComputePipelineState
 
     private var casOutput: MTLTexture?
     private var neuralUpscaled: MTLTexture?
@@ -34,17 +39,23 @@ final class EnhancementProcessor {
     private var lastSize: (width: Int, height: Int) = (0, 0)
     private(set) var neuralSupported = true
 
-    init?(device: MTLDevice, library: MTLLibrary) {
+    init?(device: MTLDevice, library: MTLLibrary,
+          pixelFormat: MTLPixelFormat = .bgra8Unorm,
+          hdrInput: Bool = false) {
         guard let enhanceFn = library.makeFunction(name: "enhanceKernel"),
-              let pipeline = try? device.makeComputePipelineState(function: enhanceFn),
+              let downsampleFn = library.makeFunction(name: "downsampleKernel"),
+              let enhance = try? device.makeComputePipelineState(function: enhanceFn),
               let blendFn = library.makeFunction(name: "blendEnhancementKernel"),
-              let blend = try? device.makeComputePipelineState(function: blendFn) else {
+              let blend = try? device.makeComputePipelineState(function: blendFn),
+              let downsample = try? device.makeComputePipelineState(function: downsampleFn) else {
             return nil
         }
         self.device = device
-        self.enhancePipeline = pipeline
+        self.pixelFormat = pixelFormat
+        self.hdrInput = hdrInput
+        self.enhancePipeline = enhance
         self.blendPipeline = blend
-        self.lanczos = MPSImageLanczosScale(device: device)
+        self.downsamplePipeline = downsample
     }
 
     /// Enhances `input` at its own resolution. Not thread-safe — call from
@@ -60,9 +71,10 @@ final class EnhancementProcessor {
             scaler.colorTexture = input
             scaler.outputTexture = upscaled
             scaler.encode(commandBuffer: commandBuffer)
-            lanczos.encode(commandBuffer: commandBuffer,
-                           sourceTexture: upscaled,
-                           destinationTexture: downscaled)
+            guard downsample(from: upscaled, to: downscaled, commandBuffer: commandBuffer) else {
+                return applyCAS(to: input, sharpness: Float(strength),
+                                denoise: Float(strength * 0.7), commandBuffer: commandBuffer)
+            }
             // The supersample already denoised/reconstructed — finish with
             // a lighter sharpen only.
             return applyCAS(to: downscaled,
@@ -104,6 +116,10 @@ final class EnhancementProcessor {
     private func ensureResources(width: Int, height: Int, wantNeural: Bool) {
         if lastSize != (width, height) {
             lastSize = (width, height)
+            // A size-specific failure (for example an oversized 8K frame or
+            // temporary allocation pressure) must not permanently disable
+            // Neural enhancement for later, smaller videos.
+            neuralSupported = true
             casOutput = makeTexture(width: width, height: height, renderTarget: false)
             neuralScaler = nil
             neuralUpscaled = nil
@@ -111,7 +127,12 @@ final class EnhancementProcessor {
         }
 
         if wantNeural, neuralSupported, neuralScaler == nil {
-            guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
+            // The neural path reconstructs at 2x internally; that intermediate
+            // texture must stay within the GPU's 16384-per-side limit. For
+            // frames wider/taller than 8192 (e.g. 8K VR), fall back to the
+            // Classic engine rather than failing.
+            guard width * 2 <= 16384, height * 2 <= 16384,
+                  MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
                 neuralSupported = false
                 return
             }
@@ -120,9 +141,9 @@ final class EnhancementProcessor {
             descriptor.inputHeight = height
             descriptor.outputWidth = width * 2
             descriptor.outputHeight = height * 2
-            descriptor.colorTextureFormat = .bgra8Unorm
-            descriptor.outputTextureFormat = .bgra8Unorm
-            descriptor.colorProcessingMode = .perceptual
+            descriptor.colorTextureFormat = pixelFormat
+            descriptor.outputTextureFormat = pixelFormat
+            descriptor.colorProcessingMode = hdrInput ? .hdr : .perceptual
             guard let scaler = descriptor.makeSpatialScaler(device: device),
                   let upscaled = makeTexture(width: width * 2, height: height * 2, renderTarget: true),
                   let downscaled = makeTexture(width: width, height: height, renderTarget: false) else {
@@ -137,12 +158,25 @@ final class EnhancementProcessor {
 
     private func makeTexture(width: Int, height: Int, renderTarget: Bool) -> MTLTexture? {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
+            pixelFormat: pixelFormat, width: width, height: height, mipmapped: false
         )
         descriptor.usage = renderTarget ? [.shaderRead, .shaderWrite, .renderTarget]
                                         : [.shaderRead, .shaderWrite]
         descriptor.storageMode = .private
         return device.makeTexture(descriptor: descriptor)
+    }
+
+    private func downsample(from src: MTLTexture, to dst: MTLTexture,
+                            commandBuffer: MTLCommandBuffer) -> Bool {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        encoder.setComputePipelineState(downsamplePipeline)
+        encoder.setTexture(src, index: 0)
+        encoder.setTexture(dst, index: 1)
+        let group = MTLSize(width: 16, height: 16, depth: 1)
+        let grid = MTLSize(width: (dst.width + 15) / 16, height: (dst.height + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
+        encoder.endEncoding()
+        return true
     }
 
     private func applyCAS(to input: MTLTexture, sharpness: Float, denoise: Float,

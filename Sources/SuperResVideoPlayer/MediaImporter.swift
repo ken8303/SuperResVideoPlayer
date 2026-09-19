@@ -4,15 +4,18 @@ import CryptoKit
 enum MediaImportError: LocalizedError {
     case ffmpegNotFound
     case extractionFailed(exitCode: Int32, log: String)
+    case noAudioTrack
     case cancelled
 
     var errorDescription: String? {
         switch self {
         case .ffmpegNotFound:
-            return "Generating subtitles for this container needs its audio extracted first, which requires ffmpeg. Install it with `brew install ffmpeg`, then try again."
+            return "This conversion requires ffmpeg. Install it with `brew install ffmpeg`, then try again."
         case .extractionFailed(let code, let log):
             let tail = log.split(separator: "\n").suffix(2).joined(separator: " ")
             return "Audio extraction failed (ffmpeg exited \(code)). \(tail)"
+        case .noAudioTrack:
+            return "This video has no audio track, so there's nothing to transcribe into subtitles."
         case .cancelled:
             return "Audio extraction was cancelled."
         }
@@ -25,15 +28,28 @@ enum MediaImportError: LocalizedError {
 /// conversion happens anywhere*. This class exists only because the AI
 /// Subtitle Generator uses Apple's Speech framework, which reads files
 /// through AVFoundation and therefore can't open MKV/WebM/etc. Pulling just
-/// the audio track into a small temporary .m4a (stream-copy when it's
-/// already AAC/ALAC, transcode otherwise) is fast and leaves the video
+/// the audio track into a temporary 16 kHz WAV is fast and leaves the video
 /// untouched. Results are cached keyed on the source's path/size/mtime.
-final class MediaImporter {
+///
+/// `@unchecked Sendable`: process and cancellation state are guarded by
+/// `processLock`, and work is dispatched onto a serial queue — the safety
+/// the compiler can't verify is enforced manually here.
+final class MediaImporter: @unchecked Sendable {
 
-    /// Whether Speech/AVFoundation can read this file directly, or its
-    /// audio needs extracting first. Decided by sniffing the actual file
-    /// content, not the extension — files are often mislabeled (e.g. an
-    /// .mkv renamed to .mp4 plays fine in mpv but is still Matroska inside).
+    /// Pure audio files that `AVAudioFile` (used by both speech engines) can
+    /// open directly. Everything else — including video containers like
+    /// .mp4/.mov that AVAudioFile CANNOT demux — needs its audio extracted
+    /// first for transcription.
+    static func isPureAudioFile(_ url: URL) -> Bool {
+        ["m4a", "mp3", "wav", "aac", "caf", "aiff", "aif", "aifc", "flac", "au", "m4b"]
+            .contains(url.pathExtension.lowercased())
+    }
+
+    /// Whether the video exporter's AVAssetReader needs this repackaged
+    /// first. Decided by sniffing the actual file content, not the
+    /// extension — files are often mislabeled (e.g. an .mkv renamed to .mp4
+    /// plays fine in mpv but is still Matroska inside). AVAssetReader reads
+    /// mp4/mov natively, so those return false here (unlike the audio path).
     static func needsAudioExtraction(_ url: URL) -> Bool {
         if let handle = try? FileHandle(forReadingFrom: url) {
             defer { try? handle.close() }
@@ -64,16 +80,9 @@ final class MediaImporter {
         self.executableResolver = executableResolver ?? Self.findExecutable
     }
     private var runningProcess: Process?
-    private var cancellationGeneration: UInt64 = 0
-
-    private func generationSnapshot() -> UInt64 {
-        processLock.lock()
-        defer { processLock.unlock() }
-        return cancellationGeneration
-    }
 
     private func checkCancellation(_ generation: UInt64) throws {
-        guard generationSnapshot() == generation else { throw MediaImportError.cancelled }
+        guard currentCancellationGeneration() == generation else { throw MediaImportError.cancelled }
     }
 
     private func start(_ process: Process, generation: UInt64) throws {
@@ -89,6 +98,11 @@ final class MediaImporter {
         runningProcess = nil
         processLock.unlock()
     }
+    /// Incremented on Cancel even when ffmpeg has not launched yet, closing
+    /// the race where a click landed during probing and therefore had no
+    /// process to terminate. Each operation captures its starting value, so
+    /// later operations are not poisoned by an earlier cancellation.
+    private var cancellationGeneration: UInt64 = 0
 
     /// Terminates any in-flight ffmpeg process. The awaiting `extractAudio`
     /// call then throws `MediaImportError.cancelled`.
@@ -99,20 +113,92 @@ final class MediaImporter {
         processLock.unlock()
     }
 
-    /// Extracts `url`'s first audio track to a temporary .m4a, reporting
-    /// rough progress (0...1) on the main queue. Returns the cached output
-    /// immediately if this exact file was extracted before.
-    func extractAudio(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
-        let generation = generationSnapshot()
+    private func currentCancellationGeneration() -> UInt64 {
+        processLock.lock()
+        defer { processLock.unlock() }
+        return cancellationGeneration
+    }
+
+    /// Extracts one of `url`'s audio tracks to a temporary WAV, reporting
+    /// rough progress (0...1) on the main queue. `audioStreamIndex` is the
+    /// zero-based position among the file's audio streams (container order —
+    /// matches the order mpv lists them in the app's Audio picker). Returns
+    /// the cached output immediately if this exact file+track was extracted
+    /// before.
+    func extractAudio(from url: URL, audioStreamIndex: Int = 0,
+                      onProgress: @escaping (Double) -> Void) async throws -> URL {
+        let operationGeneration = currentCancellationGeneration()
         return try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
-                    continuation.resume(returning: try self.extractAudioSync(url: url, generation: generation, onProgress: onProgress))
+                    continuation.resume(returning: try self.extractAudioSync(
+                        url: url, audioStreamIndex: audioStreamIndex,
+                        operationGeneration: operationGeneration, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
             }
         }
+    }
+
+    /// Transcodes to a baseline H.264 8-bit 4:2:0 .mp4 that AVAssetReader
+    /// can always decode. Used as an export fallback when the reader can't
+    /// handle the source directly (e.g. 10-bit HEVC). The export pipeline
+    /// currently consumes BGRA8, so this fallback matches that constraint.
+    func transcodeForExport(from url: URL, audioStreamIndex: Int = 0,
+                            onProgress: @escaping (Double) -> Void) async throws -> URL {
+        let operationGeneration = currentCancellationGeneration()
+        return try await withCheckedThrowingContinuation { continuation in
+            workQueue.async {
+                do {
+                    continuation.resume(returning: try self.transcodeForExportSync(
+                        url: url, audioStreamIndex: audioStreamIndex,
+                        operationGeneration: operationGeneration, onProgress: onProgress))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func transcodeForExportSync(url: URL, audioStreamIndex: Int,
+                                        operationGeneration: UInt64,
+                                        onProgress: @escaping (Double) -> Void) throws -> URL {
+        try checkCancellation(operationGeneration)
+        guard let ffmpeg = executableResolver("ffmpeg") else {
+            throw MediaImportError.ffmpegNotFound
+        }
+        let kind = audioStreamIndex == 0 ? "compat" : "compat-a\(audioStreamIndex)"
+        let outputURL = try cachedOutputURL(for: url, kind: kind, ext: "mp4")
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            return outputURL
+        }
+        let info = probe(url: url, generation: operationGeneration)
+        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("\(UUID().uuidString).part.mp4")
+        defer { try? FileManager.default.removeItem(at: partialURL) }
+
+        let args = [
+            "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
+            "-i", url.path,
+            "-map", "0:v:0", "-map", "0:a:\(audioStreamIndex)?", "-sn",
+            "-c:v", "h264_videotoolbox", "-pix_fmt", "yuv420p", "-b:v", "20M",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", partialURL.path
+        ]
+        do {
+            try runFFmpeg(arguments: args, ffmpegPath: ffmpeg,
+                          durationSeconds: info.duration,
+                          operationGeneration: operationGeneration,
+                          onProgress: onProgress)
+        } catch {
+            try? FileManager.default.removeItem(at: partialURL)
+            throw error
+        }
+        try checkCancellation(operationGeneration)
+        if !FileManager.default.fileExists(atPath: outputURL.path) {
+            try FileManager.default.moveItem(at: partialURL, to: outputURL)
+        }
+        return outputURL
     }
 
     /// Repackages an AVFoundation-unreadable container (MKV, WebM, ...)
@@ -120,12 +206,15 @@ final class MediaImporter {
     /// Stream-copies H.264/HEVC video (lossless, fast); transcodes other
     /// codecs via the VideoToolbox hardware encoder. Audio goes to AAC
     /// unless already MP4-compatible.
-    func remuxVideoToMP4(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
-        let generation = generationSnapshot()
+    func remuxVideoToMP4(from url: URL, audioStreamIndex: Int = 0,
+                         onProgress: @escaping (Double) -> Void) async throws -> URL {
+        let operationGeneration = currentCancellationGeneration()
         return try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
-                    continuation.resume(returning: try self.remuxVideoSync(url: url, generation: generation, onProgress: onProgress))
+                    continuation.resume(returning: try self.remuxVideoSync(
+                        url: url, audioStreamIndex: audioStreamIndex,
+                        operationGeneration: operationGeneration, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -133,22 +222,30 @@ final class MediaImporter {
         }
     }
 
-    private func remuxVideoSync(url: URL, generation: UInt64, onProgress: @escaping (Double) -> Void) throws -> URL {
-        try checkCancellation(generation)
+    private func remuxVideoSync(url: URL, audioStreamIndex: Int,
+                                operationGeneration: UInt64,
+                                onProgress: @escaping (Double) -> Void) throws -> URL {
+        try checkCancellation(operationGeneration)
         guard let ffmpeg = executableResolver("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
         }
 
-        let outputURL = try cachedOutputURL(for: url, kind: "video", ext: "mp4")
+        // Keyed per audio track — see extractAudioSync.
+        let kind = audioStreamIndex == 0 ? "video" : "video-a\(audioStreamIndex)"
+        let outputURL = try cachedOutputURL(for: url, kind: kind, ext: "mp4")
         if FileManager.default.fileExists(atPath: outputURL.path) {
             return outputURL
         }
 
-        let info = probe(url: url, generation: generation)
+        let info = probe(url: url, generation: operationGeneration)
         let copyableVideo: Set<String> = ["h264", "hevc"]
         let copyableAudio: Set<String> = ["aac", "mp3", "alac", "ac3", "eac3"]
         let videoCopy = info.videoCodec.map { copyableVideo.contains($0) } ?? false
-        let audioCopy = info.audioCodec.map { copyableAudio.contains($0) } ?? false
+        // The probe reports the codec of the *first* audio stream only; for
+        // any other selected track just re-encode to AAC rather than trust a
+        // codec we didn't probe.
+        let audioCopy = audioStreamIndex == 0
+            && (info.audioCodec.map { copyableAudio.contains($0) } ?? false)
 
         let partialURL = outputURL.deletingPathExtension().appendingPathExtension("\(UUID().uuidString).part.mp4")
         defer { try? FileManager.default.removeItem(at: partialURL) }
@@ -157,7 +254,7 @@ final class MediaImporter {
             var args = [
                 "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
                 "-i", url.path,
-                "-map", "0:v:0", "-map", "0:a:0?", "-sn"
+                "-map", "0:v:0", "-map", "0:a:\(audioStreamIndex)?", "-sn"
             ]
             if videoCopy {
                 args += ["-c:v", "copy"]
@@ -172,7 +269,8 @@ final class MediaImporter {
 
         do {
             try runFFmpeg(arguments: arguments(videoCopy: videoCopy, audioCopy: audioCopy),
-                          ffmpegPath: ffmpeg, generation: generation, durationSeconds: info.duration, onProgress: onProgress)
+                          ffmpegPath: ffmpeg, durationSeconds: info.duration,
+                          operationGeneration: operationGeneration, onProgress: onProgress)
         } catch let error as MediaImportError {
             if case .cancelled = error {
                 try? FileManager.default.removeItem(at: partialURL)
@@ -186,59 +284,79 @@ final class MediaImporter {
             // transcode before giving up.
             try? FileManager.default.removeItem(at: partialURL)
             try runFFmpeg(arguments: arguments(videoCopy: false, audioCopy: false),
-                          ffmpegPath: ffmpeg, generation: generation, durationSeconds: info.duration, onProgress: onProgress)
+                          ffmpegPath: ffmpeg, durationSeconds: info.duration,
+                          operationGeneration: operationGeneration, onProgress: onProgress)
         }
 
-        try checkCancellation(generation)
-        // Another importer may have populated the shared cache meanwhile.
+        try checkCancellation(operationGeneration)
         if !FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.moveItem(at: partialURL, to: outputURL)
         }
         return outputURL
     }
 
-    private func extractAudioSync(url: URL, generation: UInt64, onProgress: @escaping (Double) -> Void) throws -> URL {
-        try checkCancellation(generation)
+    private func extractAudioSync(url: URL, audioStreamIndex: Int,
+                                  operationGeneration: UInt64,
+                                  onProgress: @escaping (Double) -> Void) throws -> URL {
+        try checkCancellation(operationGeneration)
         guard let ffmpeg = executableResolver("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
         }
 
-        let outputURL = try cachedOutputURL(for: url, kind: "audio", ext: "m4a")
+        // The cache must be keyed per track, or switching the Audio picker
+        // and regenerating subtitles would silently reuse the previous
+        // track's extraction. ("audio" for track 0 keeps old caches valid.)
+        let kind = audioStreamIndex == 0 ? "audio" : "audio-a\(audioStreamIndex)"
+        let outputURL = try cachedOutputURL(for: url, kind: kind, ext: "wav")
         if FileManager.default.fileExists(atPath: outputURL.path) {
             return outputURL
         }
 
-        let info = probe(url: url, generation: generation)
+        let info = probe(url: url, generation: operationGeneration)
 
-        // AAC/ALAC can be stream-copied into .m4a losslessly; everything
-        // else (FLAC, Opus, AC-3, ...) is transcoded to AAC — still fast,
-        // since it's audio only.
-        let copyable: Set<String> = ["aac", "alac"]
-        let audioCopy = info.audioCodec.map { copyable.contains($0) } ?? false
+        // Probe found video but no audio (both nil only when ffprobe itself
+        // is unavailable, in which case we let ffmpeg try and report). A
+        // video-only file has nothing to transcribe.
+        if info.videoCodec != nil, info.audioCodec == nil {
+            throw MediaImportError.noAudioTrack
+        }
 
         // Write to a partial file and rename on success, so a cancelled or
         // failed extraction never leaves a truncated file in the cache.
-        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("\(UUID().uuidString).part.m4a")
+        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("\(UUID().uuidString).part.wav")
         defer { try? FileManager.default.removeItem(at: partialURL) }
 
-        var args = [
+        // Extract to 16 kHz mono 16-bit PCM WAV — the canonical input for
+        // Apple's speech engines, read natively by AVAudioFile, and free of
+        // any container/movflags quirks (an m4a + `-movflags +faststart`
+        // output was rejected by some ffmpeg builds with EINVAL).
+        let args = [
             "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
             "-i", url.path,
-            "-vn", "-sn", "-map", "0:a:0"
+            "-vn", "-sn", "-map", "0:a:\(audioStreamIndex)",
+            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+            partialURL.path
         ]
-        args += audioCopy ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", "160k"]
-        args += ["-movflags", "+faststart", partialURL.path]
 
         do {
-            try runFFmpeg(arguments: args, ffmpegPath: ffmpeg, generation: generation,
-                          durationSeconds: info.duration, onProgress: onProgress)
+            try runFFmpeg(arguments: args, ffmpegPath: ffmpeg,
+                          durationSeconds: info.duration,
+                          operationGeneration: operationGeneration,
+                          onProgress: onProgress)
         } catch {
             try? FileManager.default.removeItem(at: partialURL)
+            // When ffprobe wasn't available to pre-detect it, a video-only
+            // file surfaces here as ffmpeg's "matches no streams" — map it
+            // to the clear no-audio message.
+            if case let MediaImportError.extractionFailed(_, log) = error,
+               log.localizedCaseInsensitiveContains("matches no streams")
+                || log.localizedCaseInsensitiveContains("does not contain any stream") {
+                throw MediaImportError.noAudioTrack
+            }
             throw error
         }
 
-        try checkCancellation(generation)
-        // Another importer may have populated the shared cache meanwhile.
+        try checkCancellation(operationGeneration)
         if !FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.moveItem(at: partialURL, to: outputURL)
         }
@@ -248,8 +366,8 @@ final class MediaImporter {
     private func runFFmpeg(
         arguments: [String],
         ffmpegPath: String,
-        generation: UInt64,
         durationSeconds: Double,
+        operationGeneration: UInt64,
         onProgress: @escaping (Double) -> Void
     ) throws {
         let process = Process()
@@ -275,7 +393,7 @@ final class MediaImporter {
         // `-progress pipe:1` emits key=value lines; out_time_us is the
         // current output timestamp in microseconds.
         stdout.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData // Drain even when progress cannot be calculated.
+            let data = handle.availableData
             guard durationSeconds.isFinite, durationSeconds > 0,
                   let text = String(data: data, encoding: .utf8) else { return }
             for line in text.split(separator: "\n") where line.hasPrefix("out_time_us=") {
@@ -287,16 +405,34 @@ final class MediaImporter {
         }
 
         defer {
-            clearRunningProcess()
             stdout.fileHandleForReading.readabilityHandler = nil
             stderr.fileHandleForReading.readabilityHandler = nil
         }
 
-        try start(process, generation: generation)
+        // Hold the lock across launch and publication. `cancel()` therefore
+        // either records cancellation before launch (and we do not start) or
+        // sees the running process immediately afterward and terminates it.
+        processLock.lock()
+        if cancellationGeneration != operationGeneration {
+            processLock.unlock()
+            throw MediaImportError.cancelled
+        }
+        do {
+            try process.run()
+            runningProcess = process
+            processLock.unlock()
+        } catch {
+            processLock.unlock()
+            throw error
+        }
         process.waitUntilExit()
-        try checkCancellation(generation)
 
-        if process.terminationReason == .uncaughtSignal {
+        processLock.lock()
+        let wasCancelled = cancellationGeneration != operationGeneration
+        runningProcess = nil
+        processLock.unlock()
+
+        if wasCancelled {
             throw MediaImportError.cancelled
         }
         guard process.terminationStatus == 0 else {
@@ -313,12 +449,16 @@ final class MediaImporter {
         var videoCodec: String?
         var audioCodec: String?
         var duration: Double
+        /// Transfer characteristics of the first video stream, e.g.
+        /// "smpte2084" (HDR10/PQ) or "arib-std-b67" (HLG). nil when untagged.
+        var colorTransfer: String?
     }
+
 
     /// Asks ffprobe what's inside the file. Failing softly just means the
     /// audio gets transcoded rather than stream-copied.
     private func probe(url: URL, generation: UInt64) -> ProbeInfo {
-        let fallback = ProbeInfo(videoCodec: nil, audioCodec: nil, duration: 0)
+        let fallback = ProbeInfo(videoCodec: nil, audioCodec: nil, duration: 0, colorTransfer: nil)
         guard let ffprobe = executableResolver("ffprobe") else { return fallback }
 
         let process = Process()
@@ -346,6 +486,7 @@ final class MediaImporter {
                 let type = stream["codec_type"] as? String
                 if type == "video", result.videoCodec == nil {
                     result.videoCodec = stream["codec_name"] as? String
+                    result.colorTransfer = stream["color_transfer"] as? String
                 }
                 if type == "audio", result.audioCodec == nil {
                     result.audioCodec = stream["codec_name"] as? String
@@ -402,6 +543,10 @@ final class MediaImporter {
             .appendingPathComponent("SuperResVideoPlayer-Media", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
+        // Keep the cache from growing without bound (remuxed .mp4s can be
+        // large). Evict oldest files first, before writing a new one.
+        Self.pruneCache(directory: directory, maxTotalBytes: 3_000_000_000)
+
         // Key on path + size + mtime so an edited/replaced source file
         // doesn't serve a stale cached extraction.
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -414,5 +559,34 @@ final class MediaImporter {
             .prefix(16)
 
         return directory.appendingPathComponent("\(digest)-\(kind).\(ext)")
+    }
+
+    /// Evicts the oldest cache files (by modification date) until the total
+    /// size is within `maxTotalBytes`. Skips in-progress `.part.*` files so
+    /// an active extraction isn't deleted out from under itself.
+    private static func pruneCache(directory: URL, maxTotalBytes: Int) {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+        guard let items = try? fm.contentsOfDirectory(at: directory,
+                                                      includingPropertiesForKeys: keys) else { return }
+
+        var files = items.compactMap { url -> (url: URL, size: Int, date: Date)? in
+            guard !url.lastPathComponent.contains(".part."),
+                  let v = try? url.resourceValues(forKeys: Set(keys)),
+                  v.isRegularFile == true,
+                  let size = v.fileSize, let date = v.contentModificationDate else { return nil }
+            return (url, size, date)
+        }
+
+        var total = files.reduce(0) { $0 + $1.size }
+        guard total > maxTotalBytes else { return }
+
+        files.sort { $0.date < $1.date }   // oldest first
+        for file in files {
+            if total <= maxTotalBytes { break }
+            if (try? fm.removeItem(at: file.url)) != nil {
+                total -= file.size
+            }
+        }
     }
 }

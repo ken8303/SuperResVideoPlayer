@@ -1,5 +1,6 @@
 import Foundation
 import FoundationModels
+import SuperResCore
 
 enum SubtitleTranslationError: LocalizedError {
     case appleIntelligenceUnavailable(String)
@@ -62,7 +63,12 @@ enum SubtitleTranslator {
             .localizedString(forIdentifier: sourceLocale.identifier) ?? sourceLocale.identifier
         let targetName = languageName(for: targetIdentifier)
 
-        let batchSize = 15
+        // The macOS 27 on-device model has a larger context window, so we
+        // translate more lines per request — fewer round-trips, faster full
+        // videos, and more consistent phrasing within a scene. A failed or
+        // garbled batch still falls back to per-line retry below, so a
+        // larger batch never risks losing more than it re-processes.
+        let batchSize = 40
         var completed = 0
         var untranslated = 0
 
@@ -79,7 +85,7 @@ enum SubtitleTranslator {
                 let response = try await makeSession(sourceName: sourceName, targetName: targetName)
                     .respond(to: numberedLines)
 
-                for (number, text) in parse(response.content) {
+                for (number, text) in TranslationResponseParser.parse(response.content) {
                     let index = batchStart + number - 1
                     if range.contains(index) {
                         updates[index] = text
@@ -125,29 +131,14 @@ enum SubtitleTranslator {
             return nil // this specific line is blocked — keep the original
         }
 
-        if let parsed = parse(content)[1] {
+        if let parsed = TranslationResponseParser.parse(content)[1] {
             return parsed
         }
         return content
             .split(separator: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .first { !$0.isEmpty }
-            .map(stripNumberPrefix)
-    }
-
-    /// Removes a leading "N|" / "N:" / "N." (ASCII or full-width) that the
-    /// model sometimes emits with the wrong number, which the strict parser
-    /// rejects but shouldn't end up inside a subtitle.
-    private static func stripNumberPrefix(_ line: String) -> String {
-        let separators: Set<Character> = ["|", ":", ".", "｜", "：", "．", "、"]
-        var index = line.startIndex
-        while index < line.endIndex, line[index].isNumber {
-            index = line.index(after: index)
-        }
-        guard index > line.startIndex, index < line.endIndex, separators.contains(line[index]) else {
-            return line
-        }
-        return String(line[line.index(after: index)...]).trimmingCharacters(in: .whitespaces)
+            .map(TranslationResponseParser.stripNumberPrefix)
     }
 
     private static func makeSession(sourceName: String, targetName: String) -> LanguageModelSession {
@@ -169,29 +160,6 @@ enum SubtitleTranslator {
         N|translation, preserving the input numbers. Output nothing else — \
         no commentary, no blank lines.
         """)
-    }
-
-    /// Lenient parser for "N|translation" lines (also tolerates "N:" / "N.").
-    /// Lines that don't parse are simply skipped — those cues keep their
-    /// original text rather than failing the whole batch.
-    private static func parse(_ content: String) -> [Int: String] {
-        var result: [Int: String] = [:]
-        for rawLine in content.split(separator: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            // Accept ASCII and full-width separators — Chinese/Japanese
-            // output often comes back as "１：…" or "1｜…".
-            let separators: Set<Character> = ["|", ":", ".", "｜", "：", "．", "、"]
-            guard let separatorIndex = line.firstIndex(where: { separators.contains($0) }) else {
-                continue
-            }
-            let numberPart = line[..<separatorIndex].trimmingCharacters(in: .whitespaces)
-            guard let number = Int(numberPart) else { continue }
-            let text = line[line.index(after: separatorIndex)...].trimmingCharacters(in: .whitespaces)
-            if !text.isEmpty {
-                result[number] = text
-            }
-        }
-        return result
     }
 
     private static func message(for reason: SystemLanguageModel.Availability.UnavailableReason) -> String {

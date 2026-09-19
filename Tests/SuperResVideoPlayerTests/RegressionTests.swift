@@ -1,3 +1,4 @@
+import SuperResCore
 import XCTest
 import AVFoundation
 import Metal
@@ -294,5 +295,25 @@ final class RegressionTests: XCTestCase {
                            cues.first { time >= $0.startTime && time <= $0.endTime }?.text)
         }
         XCTAssertNil(SubtitleTimeline(cues: []).text(at: 1))
+    }
+
+    func testAudioExtractionKeepsSelectedTrackAndWAVFormat() async throws {
+        let directory = try temporaryDirectory()
+        let source = directory.appendingPathComponent("input.mkv")
+        let arguments = directory.appendingPathComponent("arguments.txt")
+        try Data("source".utf8).write(to: source)
+        let ffmpeg = try executable(in: directory, name: "ffmpeg", body: """
+        printf '%s\\n' "$@" > '\(arguments.path)'
+        for destination do :; done
+        printf media > "$destination"
+        """)
+        let importer = MediaImporter(executableResolver: { $0 == "ffmpeg" ? ffmpeg : nil })
+        let output = try await importer.extractAudio(from: source, audioStreamIndex: 2) { _ in }
+        defer { try? FileManager.default.removeItem(at: output) }
+        XCTAssertEqual(output.pathExtension, "wav")
+        let invocation = try String(contentsOf: arguments, encoding: .utf8)
+        XCTAssertTrue(invocation.contains("0:a:2"))
+        XCTAssertTrue(invocation.contains("pcm_s16le"))
+        XCTAssertEqual(try Data(contentsOf: output), Data("media".utf8))
     }
 }
