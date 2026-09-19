@@ -171,3 +171,14 @@ kernel void warpBlendKernel(texture2d<float, access::sample> previousTexture [[t
     float4 blended = mix(colorFromPrevious, colorFromCurrent, t);
     outputTexture.write(blended, gid);
 }
+
+/// Strength control for the offline Core ML enhancer.
+kernel void blendEnhancementKernel(texture2d<float, access::read> original [[texture(0)]],
+                                   texture2d<float, access::read> enhanced [[texture(1)]],
+                                   texture2d<float, access::write> output [[texture(2)]],
+                                   constant float &strength [[buffer(0)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= output.get_width() || gid.y >= output.get_height()) { return; }
+    output.write(float4(mix(original.read(gid).rgb, enhanced.read(gid).rgb,
+                            saturate(strength)), 1.0), gid);
+}

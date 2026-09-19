@@ -80,11 +80,18 @@ final class VideoExporter {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             workQueue.async {
                 do {
-                    try self.exportSync(source: source, destination: destination,
-                                        configuration: configuration, onProgress: onProgress)
+                    try self.checkCancelled()
+                    guard source.resolvingSymlinksInPath().standardizedFileURL !=
+                            destination.resolvingSymlinksInPath().standardizedFileURL else {
+                        throw VideoExportError.writerSetupFailed("Choose a destination other than the source video.")
+                    }
+                    try ExportDestination.write(to: destination) { temporary in
+                        try self.exportSync(source: source, destination: temporary,
+                                            configuration: configuration, onProgress: onProgress)
+                        try self.checkCancelled()
+                    }
                     continuation.resume()
                 } catch {
-                    try? FileManager.default.removeItem(at: destination)
                     continuation.resume(throwing: error)
                 }
             }
@@ -214,7 +221,6 @@ final class VideoExporter {
 
         // MARK: Writer
 
-        try? FileManager.default.removeItem(at: destination)
         let writer = try AVAssetWriter(outputURL: destination, fileType: .mp4)
         let outputFPS = sourceFPS * Double(multiplier)
         let bitrate = min(80_000_000, max(2_000_000, Int(Double(outWidth * outHeight) * outputFPS * 0.07)))
@@ -227,6 +233,12 @@ final class VideoExporter {
                 AVVideoExpectedSourceFrameRateKey: Int(outputFPS.rounded())
             ]
         ])
+        var outputTransform = videoTrack.preferredTransform
+        let rotatedBounds = CGRect(x: 0, y: 0, width: outWidth, height: outHeight)
+            .applying(outputTransform)
+        outputTransform.tx -= rotatedBounds.minX
+        outputTransform.ty -= rotatedBounds.minY
+        videoInput.transform = outputTransform
         videoInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoInput) else {
             throw VideoExportError.writerSetupFailed("Video settings rejected.")
@@ -265,6 +277,9 @@ final class VideoExporter {
 
         // MARK: Frame helpers (called on providerQueue)
 
+        // Used only by the serial video provider. GPU work completes before
+        // each stage releases these Core Video texture wrappers.
+        var frameTextureBackings: [CVMetalTexture] = []
         func wrapTexture(_ pixelBuffer: CVPixelBuffer, format: MTLPixelFormat) -> MTLTexture? {
             var cvTexture: CVMetalTexture?
             let status = CVMetalTextureCacheCreateTextureFromImage(
@@ -272,6 +287,7 @@ final class VideoExporter {
                 CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer), 0, &cvTexture
             )
             guard status == kCVReturnSuccess, let cvTexture else { return nil }
+            frameTextureBackings.append(cvTexture)
             return CVMetalTextureGetTexture(cvTexture)
         }
 
@@ -282,7 +298,13 @@ final class VideoExporter {
             if let maxEnhancer {
                 // Real-ESRGAN runs synchronously on its own queue; its
                 // output then flows into this command buffer's SR pass.
-                return try maxEnhancer.enhance(texture)
+                let enhanced = try maxEnhancer.enhance(texture) { try self.checkCancelled() }
+                guard let blended = enhancer.blend(original: texture, enhanced: enhanced,
+                                                    strength: configuration.enhancementStrength,
+                                                    commandBuffer: commandBuffer) else {
+                    throw VideoExportError.processingFailed("Couldn't apply the Max engine strength.")
+                }
+                return blended
             }
             return enhancer.process(texture,
                                     neural: configuration.enhancementEngine == .neural,
@@ -356,12 +378,15 @@ final class VideoExporter {
             blit.endEncoding()
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
+            guard commandBuffer.status == .completed else {
+                throw VideoExportError.processingFailed(commandBuffer.error?.localizedDescription ?? "GPU processing failed.")
+            }
             return outBuffer
         }
 
         // MARK: Provider state
 
-        var previous: (buffer: CVPixelBuffer, texture: MTLTexture, pts: CMTime)?
+        var previous: (buffer: CVPixelBuffer, texture: MTLTexture, backing: CVMetalTexture, pts: CMTime)?
         var staged: [(buffer: CVPixelBuffer, pts: CMTime)] = []
         var pendingFirstSample: CMSampleBuffer? = firstSample
         var realFrames = 0
@@ -377,9 +402,14 @@ final class VideoExporter {
         /// Processes one decoded sample into 1..multiplier staged output
         /// buffers (synthesized in-betweens first, then the real frame).
         func stageOutputs(for sample: CMSampleBuffer) throws {
+            defer { frameTextureBackings.removeAll(keepingCapacity: true) }
+            try checkCancelled()
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-            guard let texture = wrapTexture(pixelBuffer, format: .bgra8Unorm) else { return }
+            guard let texture = wrapTexture(pixelBuffer, format: .bgra8Unorm),
+                  let colorBacking = frameTextureBackings.last else {
+                throw VideoExportError.processingFailed("Couldn't access the decoded video frame.")
+            }
 
             if multiplier > 1, let prev = previous, pts > prev.pts {
                 let flowResult = computeFlow(previous: prev.buffer, current: pixelBuffer)
@@ -408,9 +438,19 @@ final class VideoExporter {
                             commandBuffer.commit()
                             continue
                         }
-                        let finalTexture = upscaleIfNeeded(try enhanceIfNeeded(synthTexture, commandBuffer: commandBuffer),
-                                                           commandBuffer: commandBuffer)
-                        let outBuffer = try renderToOutputBuffer(finalTexture, commandBuffer: commandBuffer)
+                        var enhancementCommands = commandBuffer
+                        if maxEnhancer != nil {
+                            commandBuffer.commit()
+                            commandBuffer.waitUntilCompleted()
+                            guard commandBuffer.status == .completed,
+                                  let next = commandQueue.makeCommandBuffer() else {
+                                throw VideoExportError.processingFailed("Couldn't finish the interpolated frame for the Max engine.")
+                            }
+                            enhancementCommands = next
+                        }
+                        let finalTexture = upscaleIfNeeded(try enhanceIfNeeded(synthTexture, commandBuffer: enhancementCommands),
+                                                           commandBuffer: enhancementCommands)
+                        let outBuffer = try renderToOutputBuffer(finalTexture, commandBuffer: enhancementCommands)
                         staged.append((outBuffer, prev.pts + CMTimeMultiplyByFloat64(span, multiplier: t)))
                         synthFrames += 1
                     }
@@ -424,7 +464,7 @@ final class VideoExporter {
             let outBuffer = try renderToOutputBuffer(finalTexture, commandBuffer: commandBuffer)
             staged.append((outBuffer, pts))
 
-            previous = (pixelBuffer, texture, pts)
+            previous = (pixelBuffer, texture, colorBacking, pts)
             realFrames += 1
 
             // Without this flush the texture cache pins the decoder's
@@ -483,7 +523,7 @@ final class VideoExporter {
                         videoDone.signal()
                         return
                     }
-                    try stageOutputs(for: sample)
+                    try autoreleasepool { try stageOutputs(for: sample) }
                 }
             } catch {
                 providerError = error
@@ -499,34 +539,37 @@ final class VideoExporter {
         // deadlocks the video provider almost immediately.
 
         var audioError: Error?
+        var audioFinished = false
         let audioDone = DispatchSemaphore(value: 0)
         if let audioOutput, let audioInput {
             audioInput.requestMediaDataWhenReady(on: audioQueue) {
+                guard !audioFinished else { return }
+                func finishAudio() {
+                    audioFinished = true
+                    audioInput.markAsFinished()
+                    audioDone.signal()
+                }
                 while audioInput.isReadyForMoreMediaData {
                     if self.cancelledNow {
                         audioError = VideoExportError.cancelled
-                        audioInput.markAsFinished()
-                        audioDone.signal()
+                        finishAudio()
                         return
                     }
                     let sample = audioOutput.copyNextSampleBuffer()
                     // Match the video time cap for test exports.
                     if let sample, let limit = configuration.durationLimitSeconds,
                        CMSampleBufferGetPresentationTimeStamp(sample).seconds > limit {
-                        audioInput.markAsFinished()
-                        audioDone.signal()
+                        finishAudio()
                         return
                     }
                     guard let sample else {
-                        audioInput.markAsFinished()
-                        audioDone.signal()
+                        finishAudio()
                         return
                     }
                     if !audioInput.append(sample) {
                         audioError = VideoExportError.processingFailed(
                             writer.error?.localizedDescription ?? "Audio append failed.")
-                        audioInput.markAsFinished()
-                        audioDone.signal()
+                        finishAudio()
                         return
                     }
                 }
@@ -538,12 +581,23 @@ final class VideoExporter {
         // Wait for both providers, staying responsive to cancellation
         // (cancelReading makes both copyNextSampleBuffer return nil, which
         // drains the providers cleanly).
-        while videoDone.wait(timeout: .now() + 0.25) == .timedOut {
-            if cancelledNow { reader.cancelReading() }
+        func waitForProvider(_ done: DispatchSemaphore) throws {
+            while done.wait(timeout: .now() + 0.25) == .timedOut {
+                // A failed writer stops calling providers. Cancelling only the
+                // reader cannot wake callbacks waiting for writer readiness.
+                if cancelledNow || writer.status == .failed || reader.status == .failed {
+                    reader.cancelReading()
+                    writer.cancelWriting()
+                    providerQueue.sync { }
+                    audioQueue.sync { }
+                    try checkCancelled()
+                    throw VideoExportError.processingFailed(
+                        writer.error?.localizedDescription ?? reader.error?.localizedDescription ?? "Export stopped unexpectedly.")
+                }
+            }
         }
-        while audioDone.wait(timeout: .now() + 0.25) == .timedOut {
-            if cancelledNow { reader.cancelReading() }
-        }
+        try waitForProvider(videoDone)
+        try waitForProvider(audioDone)
 
         if let providerError {
             writer.cancelWriting()
@@ -562,7 +616,12 @@ final class VideoExporter {
 
         let finishSemaphore = DispatchSemaphore(value: 0)
         writer.finishWriting { finishSemaphore.signal() }
-        finishSemaphore.wait()
+        while finishSemaphore.wait(timeout: .now() + 0.25) == .timedOut {
+            if cancelledNow {
+                writer.cancelWriting()
+                throw VideoExportError.cancelled
+            }
+        }
         guard writer.status == .completed else {
             throw VideoExportError.processingFailed(writer.error?.localizedDescription ?? "Finalizing failed.")
         }

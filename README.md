@@ -122,8 +122,8 @@ libmpv (demux + decode + audio + A/V sync)
   ghosting around fast/complex motion, especially at 3x. During playback,
   interpolation only engages when Vision keeps up in real time — the stats
   line shows the live synth rate; export always interpolates every pair.
-- Export ignores rotation metadata and doesn't tag HDR color primaries —
-  fine for typical SDR files, wrong for rotated phone footage or HDR.
+- Export preserves rotation metadata, including after upscaling, but still
+  uses an 8-bit SDR pipeline and does not preserve HDR color metadata.
 - The cue-grouping heuristic is pause/length-based, not linguistic; breaks
   won't always land on natural phrase boundaries.
 - Subtitle translation quality is "on-device LLM" grade — good for
@@ -173,3 +173,16 @@ The **Max** engine uses the [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN
 `realesr-animevideov3` model (BSD-3-Clause, Xintao Wang et al.). The model
 is downloaded/converted locally by `convert-model.sh` and is **not**
 included in this repository or in `make-dist.sh` bundles.
+
+## Regression checks
+
+After installing the build dependencies, run `swift test`. The suite covers
+transactional export replacement, cancellation, container sniffing, unknown-duration
+FFmpeg pipe handling, subtitle cancellation, GPU strength blending, and a small
+HEVC export that verifies decoded frame count and rotation metadata. GPU tests
+require a Metal device. The real Core ML model and speech downloads are not
+required by these tests.
+
+Playback caches enhancement/upscale output for repeated decoded frames when
+interpolation is off. This avoids rerunning those GPU passes at the display
+refresh rate (including while paused); drawing still follows the display clock.

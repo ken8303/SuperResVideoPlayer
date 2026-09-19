@@ -90,6 +90,11 @@ let package = Package(
                     "-Xlinker", infoPlistPath
                 ])
             ]
+        ),
+        .testTarget(
+            name: "SuperResVideoPlayerTests",
+            dependencies: ["SuperResVideoPlayer"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
 )

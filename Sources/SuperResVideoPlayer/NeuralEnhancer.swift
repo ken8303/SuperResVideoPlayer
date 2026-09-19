@@ -42,6 +42,7 @@ final class NeuralEnhancer {
     private var textureCache: CVMetalTextureCache?
     private var tileInputBuffer: CVPixelBuffer?
     private var tileInputTexture: MTLTexture?
+    private var tileInputBacking: CVMetalTexture?
     private var tileDownTexture: MTLTexture?
     private var outputTexture: MTLTexture?
     private var lastFrameSize: (width: Int, height: Int) = (0, 0)
@@ -89,7 +90,15 @@ final class NeuralEnhancer {
             throw VideoExportError.processingFailed("Couldn't allocate tile buffers for the Max engine.")
         }
         tileInputBuffer = buffer
-        tileInputTexture = inputTexture
+        tileInputTexture = inputTexture.texture
+        tileInputBacking = inputTexture.backing
+        // Small frames do not fill a 512px tile. Define the padding rather
+        // than feeding uninitialized memory into the model.
+        CVPixelBufferLockBaseAddress(buffer, [])
+        if let base = CVPixelBufferGetBaseAddress(buffer) {
+            memset(base, 0, CVPixelBufferGetBytesPerRow(buffer) * tileSize)
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
 
         let downDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: tileSize, height: tileSize, mipmapped: false)
@@ -98,7 +107,7 @@ final class NeuralEnhancer {
     }
 
     /// Enhances `input` at its own resolution (synchronous; export-only).
-    func enhance(_ input: MTLTexture) throws -> MTLTexture {
+    func enhance(_ input: MTLTexture, checkCancellation: () throws -> Void = {}) throws -> MTLTexture {
         let width = input.width
         let height = input.height
 
@@ -121,6 +130,7 @@ final class NeuralEnhancer {
         while tileY < height {
             var tileX = 0
             while tileX < width {
+                try checkCancellation()
                 // Source window: 512px, shifted so it stays inside the frame.
                 let srcX = max(0, min(tileX - overlap, width - tileSize))
                 let srcY = max(0, min(tileY - overlap, height - tileSize))
@@ -140,6 +150,9 @@ final class NeuralEnhancer {
                 stageBlit.endEncoding()
                 stageBuffer.commit()
                 stageBuffer.waitUntilCompleted()
+                guard stageBuffer.status == .completed else {
+                    throw VideoExportError.processingFailed(stageBuffer.error?.localizedDescription ?? "Max engine: tile upload failed.")
+                }
 
                 // 2. Inference.
                 let features = try MLDictionaryFeatureProvider(
@@ -156,9 +169,12 @@ final class NeuralEnhancer {
                     throw VideoExportError.processingFailed("Max engine: command buffer failed.")
                 }
                 lanczos.encode(commandBuffer: finishBuffer,
-                               sourceTexture: enhancedTexture,
+                               sourceTexture: enhancedTexture.texture,
                                destinationTexture: tileDownTexture)
-                if let stitch = finishBuffer.makeBlitCommandEncoder() {
+                guard let stitch = finishBuffer.makeBlitCommandEncoder() else {
+                    throw VideoExportError.processingFailed("Max engine: tile stitching failed.")
+                }
+                do {
                     let innerX = tileX - srcX
                     let innerY = tileY - srcY
                     let stitchWidth = min(core, width - tileX)
@@ -172,6 +188,10 @@ final class NeuralEnhancer {
                 }
                 finishBuffer.commit()
                 finishBuffer.waitUntilCompleted()
+                withExtendedLifetime((enhancedBuffer, enhancedTexture.backing)) { }
+                guard finishBuffer.status == .completed else {
+                    throw VideoExportError.processingFailed(finishBuffer.error?.localizedDescription ?? "Max engine: tile processing failed.")
+                }
                 CVMetalTextureCacheFlush(cache, 0)
 
                 tileX += core
@@ -183,13 +203,14 @@ final class NeuralEnhancer {
     }
 
     private static func wrap(_ pixelBuffer: CVPixelBuffer, format: MTLPixelFormat,
-                             cache: CVMetalTextureCache) -> MTLTexture? {
+                             cache: CVMetalTextureCache) -> (texture: MTLTexture, backing: CVMetalTexture)? {
         var cvTexture: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault, cache, pixelBuffer, nil, format,
             CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer), 0, &cvTexture
         )
-        guard status == kCVReturnSuccess, let cvTexture else { return nil }
-        return CVMetalTextureGetTexture(cvTexture)
+        guard status == kCVReturnSuccess, let cvTexture,
+              let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }
+        return (texture, cvTexture)
     }
 }

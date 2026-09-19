@@ -38,6 +38,7 @@ final class MPVPlayer {
         let pixelBuffer: CVPixelBuffer
         let timeSeconds: Double
         let serial: UInt64
+        let generation: UInt64
     }
 
     // MARK: Callbacks (all invoked on the main queue)
@@ -59,8 +60,10 @@ final class MPVPlayer {
     private let stateLock = NSLock()
     private var _latestFrame: Frame?
     private var frameSerial: UInt64 = 0
+    private var mediaGeneration: UInt64 = 0
     private var shuttingDown = false
     private var _pendingTimePos: Double?
+    private var observedPlaybackTime: Double = 0
 
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolSize: (width: Int, height: Int) = (0, 0)
@@ -222,6 +225,7 @@ final class MPVPlayer {
                     stateLock.lock()
                     let alreadyScheduled = _pendingTimePos != nil
                     _pendingTimePos = seconds
+                    observedPlaybackTime = seconds.isFinite ? seconds : 0
                     stateLock.unlock()
                     if !alreadyScheduled {
                         DispatchQueue.main.async { [weak self] in
@@ -273,6 +277,8 @@ final class MPVPlayer {
         // screen while the new file spins up.
         stateLock.lock()
         _latestFrame = nil
+        mediaGeneration &+= 1
+        observedPlaybackTime = 0
         stateLock.unlock()
 
         command(["loadfile", url.path, "replace"])
@@ -286,13 +292,21 @@ final class MPVPlayer {
     }
 
     func seek(to seconds: Double) {
+        guard seconds.isFinite else { return }
+        stateLock.lock()
+        mediaGeneration &+= 1
+        _latestFrame = nil
+        observedPlaybackTime = max(0, seconds)
+        stateLock.unlock()
         command(["seek", String(seconds), "absolute+exact"])
     }
 
     /// Current playback position in seconds. Thread-safe; used by the
     /// renderer every draw to compute the interpolation phase.
     var playbackTime: Double {
-        getDouble("time-pos") ?? 0
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return observedPlaybackTime
     }
 
     // MARK: Frame output
@@ -305,6 +319,7 @@ final class MPVPlayer {
         stateLock.lock()
         let context = renderContext
         let isShuttingDown = shuttingDown
+        let generation = mediaGeneration
         stateLock.unlock()
         guard let context, !isShuttingDown else { return }
 
@@ -329,8 +344,10 @@ final class MPVPlayer {
         }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            return
+        }
 
         var size: [Int32] = [Int32(width), Int32(height)]
         var stride: Int = CVPixelBufferGetBytesPerRow(pixelBuffer)
@@ -355,15 +372,18 @@ final class MPVPlayer {
                 }
             }
         }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
         guard status >= 0 else { return }
 
         let timeSeconds = getDoubleUnlocked("time-pos") ?? 0
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard generation == mediaGeneration else { return }
         frameSerial &+= 1
         _latestFrame = Frame(pixelBuffer: pixelBuffer,
                              timeSeconds: timeSeconds,
-                             serial: frameSerial)
-        stateLock.unlock()
+                             serial: frameSerial,
+                             generation: generation)
     }
 
     /// Most recently rendered frame; consumed by the Metal draw loop.

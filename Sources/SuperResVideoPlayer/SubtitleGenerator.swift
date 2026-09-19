@@ -78,6 +78,15 @@ final class SubtitleGenerator {
     /// the recognition result-handler thread, and `cancel()`.
     private let continuationLock = NSLock()
     private var pendingContinuation: CheckedContinuation<[SubtitleCue], Error>?
+    private var isCancelled = false
+
+    private func checkCancellation() throws {
+        continuationLock.lock()
+        let cancelled = isCancelled
+        continuationLock.unlock()
+        if cancelled { throw CancellationError() }
+        try Task.checkCancellation()
+    }
 
     /// Cancellation hook for an in-flight SpeechAnalyzer session.
     private var cancelModernAnalysis: (() -> Void)?
@@ -86,8 +95,10 @@ final class SubtitleGenerator {
     /// (unavailable-from-async in Swift 6 mode).
     private func setCancelModernAnalysis(_ handler: (() -> Void)?) {
         continuationLock.lock()
-        cancelModernAnalysis = handler
+        let cancelled = isCancelled
+        cancelModernAnalysis = cancelled ? nil : handler
         continuationLock.unlock()
+        if cancelled { handler?() }
     }
 
     /// Optional UI hook: called (on the main queue) with human-readable
@@ -100,13 +111,14 @@ final class SubtitleGenerator {
 
     /// Cancels any in-flight transcription (either engine).
     func cancel() {
-        task?.cancel()
-        task = nil
-
         continuationLock.lock()
+        isCancelled = true
+        let legacyTask = task
+        task = nil
         let cancelModern = cancelModernAnalysis
         cancelModernAnalysis = nil
         continuationLock.unlock()
+        legacyTask?.cancel()
         cancelModern?()
 
         resumePending(throwing: CancellationError())
@@ -124,7 +136,9 @@ final class SubtitleGenerator {
     ) async throws -> [SubtitleCue] {
         print("SuperResVideoPlayer: transcribing \(url.path) [\(locale.identifier)]")
 
+        try checkCancellation()
         let modernLocales = await SpeechTranscriber.supportedLocales
+        try checkCancellation()
         let modernSupported = modernLocales
             .contains { $0.identifier(.bcp47) == locale.identifier(.bcp47) }
         print("SuperResVideoPlayer: SpeechTranscriber locales: \(modernLocales.map { $0.identifier(.bcp47) }.sorted().joined(separator: ", "))")
@@ -187,15 +201,23 @@ final class SubtitleGenerator {
             print("SuperResVideoPlayer: speech model already installed.")
         }
 
+        try checkCancellation()
         let analyzer = SpeechAnalyzer(modules: [transcriber])
 
         // Feed the file through the analyzer concurrently with consuming
         // the results stream below.
         let analysisTask = Task {
-            if let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
-                try await analyzer.finalizeAndFinish(through: lastSample)
-            } else {
+            do {
+                if let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
+                    try await analyzer.finalizeAndFinish(through: lastSample)
+                } else {
+                    await analyzer.cancelAndFinishNow()
+                }
+            } catch {
+                // Close the results stream when feeding fails, so its
+                // consumer doesn't wait forever before reading task.value.
                 await analyzer.cancelAndFinishNow()
+                throw error
             }
         }
 
@@ -203,10 +225,18 @@ final class SubtitleGenerator {
             analysisTask.cancel()
             Task { await analyzer.cancelAndFinishNow() }
         }
-        defer { setCancelModernAnalysis(nil) }
+        var analysisFinished = false
+        defer {
+            setCancelModernAnalysis(nil)
+            if !analysisFinished {
+                analysisTask.cancel()
+                Task { await analyzer.cancelAndFinishNow() }
+            }
+        }
 
         var words: [WordTiming] = []
         for try await result in transcriber.results where result.isFinal {
+            try checkCancellation()
             for run in result.text.runs {
                 guard let timeRange = run.audioTimeRange else { continue }
                 let text = String(result.text[run.range].characters)
@@ -224,6 +254,8 @@ final class SubtitleGenerator {
             }
         }
         try await analysisTask.value
+        analysisFinished = true
+        try checkCancellation()
 
         return Self.buildCues(from: words, joiningWith: Self.wordSeparator(for: locale))
     }
@@ -236,6 +268,7 @@ final class SubtitleGenerator {
         totalDuration: TimeInterval,
         onProgress: @escaping (Double) -> Void
     ) async throws -> [SubtitleCue] {
+        try checkCancellation()
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
             throw SubtitleGenerationError.recognizerUnavailable
         }
@@ -244,6 +277,7 @@ final class SubtitleGenerator {
             throw SubtitleGenerationError.authorizationDenied
         }
 
+        try checkCancellation()
         let request = SFSpeechURLRecognitionRequest(url: url)
         request.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition {
@@ -254,6 +288,11 @@ final class SubtitleGenerator {
 
         return try await withCheckedThrowingContinuation { continuation in
             continuationLock.lock()
+            guard !isCancelled else {
+                continuationLock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return
+            }
             // If a previous generate() is somehow still pending, resume it
             // rather than leaking its suspended task.
             let stale = pendingContinuation
@@ -262,7 +301,7 @@ final class SubtitleGenerator {
             continuationLock.unlock()
             stale?.resume(throwing: CancellationError())
 
-            task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            let recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
                 guard let self else { return }
 
                 if let error {
@@ -286,6 +325,11 @@ final class SubtitleGenerator {
                     self.resumePending(returning: Self.buildCues(from: words, joiningWith: separator))
                 }
             }
+            continuationLock.lock()
+            let cancelled = isCancelled
+            if !cancelled { task = recognitionTask }
+            continuationLock.unlock()
+            if cancelled { recognitionTask.cancel() }
         }
     }
 
@@ -313,7 +357,7 @@ final class SubtitleGenerator {
     /// with spaces produces unnatural subtitles.
     private static func wordSeparator(for locale: Locale) -> String {
         let language = locale.identifier.prefix(2).lowercased()
-        return ["zh", "ja", "ko", "th"].contains(language) ? "" : " "
+        return ["zh", "ja", "th"].contains(language) ? "" : " "
     }
 
     /// Groups word-level timings into readable subtitle cues. A new cue

@@ -24,6 +24,7 @@ final class EnhancementProcessor {
 
     private let device: MTLDevice
     private let enhancePipeline: MTLComputePipelineState
+    private let blendPipeline: MTLComputePipelineState
     private let lanczos: MPSImageLanczosScale
 
     private var casOutput: MTLTexture?
@@ -35,11 +36,14 @@ final class EnhancementProcessor {
 
     init?(device: MTLDevice, library: MTLLibrary) {
         guard let enhanceFn = library.makeFunction(name: "enhanceKernel"),
-              let pipeline = try? device.makeComputePipelineState(function: enhanceFn) else {
+              let pipeline = try? device.makeComputePipelineState(function: enhanceFn),
+              let blendFn = library.makeFunction(name: "blendEnhancementKernel"),
+              let blend = try? device.makeComputePipelineState(function: blendFn) else {
             return nil
         }
         self.device = device
         self.enhancePipeline = pipeline
+        self.blendPipeline = blend
         self.lanczos = MPSImageLanczosScale(device: device)
     }
 
@@ -71,6 +75,28 @@ final class EnhancementProcessor {
                         sharpness: Float(strength),
                         denoise: Float(strength * 0.7),
                         commandBuffer: commandBuffer)
+    }
+
+    /// Mix model output with the source so Max honors the same strength
+    /// slider as the realtime engines.
+    func blend(original: MTLTexture, enhanced: MTLTexture, strength: Double,
+               commandBuffer: MTLCommandBuffer) -> MTLTexture? {
+        guard strength > 0 else { return original }
+        guard strength < 1 else { return enhanced }
+        ensureResources(width: original.width, height: original.height, wantNeural: false)
+        guard let output = casOutput,
+              let encoder = commandBuffer.makeComputeCommandEncoder() else { return nil }
+        encoder.setComputePipelineState(blendPipeline)
+        encoder.setTexture(original, index: 0)
+        encoder.setTexture(enhanced, index: 1)
+        encoder.setTexture(output, index: 2)
+        var amount = Float(strength)
+        encoder.setBytes(&amount, length: MemoryLayout<Float>.size, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (original.width + 15) / 16, height: (original.height + 15) / 16, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        encoder.endEncoding()
+        return output
     }
 
     // MARK: Internals

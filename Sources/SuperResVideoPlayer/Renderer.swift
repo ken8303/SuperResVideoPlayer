@@ -94,12 +94,24 @@ final class Renderer: NSObject, MTKViewDelegate {
     private struct FrameSample {
         let pixelBuffer: CVPixelBuffer
         let texture: MTLTexture
+        let cvTexture: CVMetalTexture
         let itemTimeSeconds: Double
     }
     private var previousSample: FrameSample?
     private var currentSample: FrameSample?
     private var lastFrameSerial: UInt64 = 0
+    private var lastMediaGeneration: UInt64?
     private var loggedFirstFrame = false
+
+    private struct ProcessingKey: Equatable {
+        let serial: UInt64
+        let superResolution: Bool
+        let scale: Double
+        let enhancement: Bool
+        let neural: Bool
+        let strength: Double
+    }
+    private var processedFrame: (key: ProcessingKey, texture: MTLTexture)?
 
     /// Caches the last synthesized in-between frame, keyed on the source
     /// pair's timestamps and the temporal phase. At 120Hz refresh with
@@ -215,7 +227,16 @@ final class Renderer: NSObject, MTKViewDelegate {
         updateFrameHistory(source: source,
                            interpolationEnabled: settings.frameInterpolationMultiplier > 1)
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        // Acquire presentation resources before encoding or caching GPU work.
+        // Otherwise a missing drawable leaves cached textures uninitialized.
+        guard let drawable = view.currentDrawable,
+              let passDescriptor = view.currentRenderPassDescriptor,
+              let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        let retainedPrevious = previousSample
+        let retainedCurrent = currentSample
+        commandBuffer.addCompletedHandler { _ in
+            withExtendedLifetime((retainedPrevious, retainedCurrent)) { }
+        }
         commandBuffer.label = "SuperResVideoPlayer.frame"
 
         guard let frameTexture = resolveDisplayTexture(
@@ -225,9 +246,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         ) else {
             // No frame to show (startup, or a new file just loaded):
             // present a clear (black) frame so stale content doesn't linger.
-            guard let drawable = view.currentDrawable,
-                  let passDescriptor = view.currentRenderPassDescriptor,
-                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
                 return
             }
             encoder.endEncoding()
@@ -236,12 +255,20 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        var textureToDisplay: MTLTexture = frameTexture
+        let processingKey = ProcessingKey(serial: lastFrameSerial,
+                                          superResolution: settings.superResolutionEnabled,
+                                          scale: settings.upscaleFactor,
+                                          enhancement: settings.imageEnhancementEnabled,
+                                          neural: settings.enhancementUsesNeural,
+                                          strength: settings.enhancementStrength)
+        let canCache = settings.frameInterpolationMultiplier == 1
+        let cached = canCache && processedFrame?.key == processingKey ? processedFrame?.texture : nil
+        var textureToDisplay: MTLTexture = cached ?? frameTexture
 
         // AI Image Enhancer: same-resolution denoise + adaptive sharpen,
         // applied before Super Resolution so the upscaler gets the cleaner
         // image.
-        if settings.imageEnhancementEnabled, settings.enhancementStrength > 0 {
+        if cached == nil, settings.imageEnhancementEnabled, settings.enhancementStrength > 0 {
             if let enhanced = enhancementProcessor?.process(frameTexture,
                                                             neural: settings.enhancementUsesNeural,
                                                             strength: settings.enhancementStrength,
@@ -250,7 +277,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
 
-        if settings.superResolutionEnabled, metalFXUpscaleSupported {
+        if cached == nil, settings.superResolutionEnabled, metalFXUpscaleSupported {
             if let upscaled = upscale(textureToDisplay,
                                        factor: settings.upscaleFactor,
                                        commandBuffer: commandBuffer) {
@@ -260,20 +287,30 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         updateStats(input: frameTexture, output: textureToDisplay, settings: settings)
 
-        // Acquire the drawable only once there's definitely something to
-        // present — an early return above with a drawable already in hand
-        // would needlessly tie up MTKView's small drawable pool.
-        guard let drawable = view.currentDrawable,
-              let passDescriptor = view.currentRenderPassDescriptor else {
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
+            cachedInterpolation = nil
+            processedFrame = nil
+            commandBuffer.commit()
             return
         }
-
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else { return }
         encoder.setRenderPipelineState(pipelineState)
+        // Preserve the video's aspect ratio when the window is resized.
+        // The render pass clears the remaining area to black.
+        let canvasWidth = Double(drawable.texture.width)
+        let canvasHeight = Double(drawable.texture.height)
+        let fit = min(canvasWidth / Double(textureToDisplay.width),
+                      canvasHeight / Double(textureToDisplay.height))
+        let videoWidth = Double(textureToDisplay.width) * fit
+        let videoHeight = Double(textureToDisplay.height) * fit
+        encoder.setViewport(MTLViewport(originX: (canvasWidth - videoWidth) / 2,
+                                        originY: (canvasHeight - videoHeight) / 2,
+                                        width: videoWidth, height: videoHeight,
+                                        znear: 0, zfar: 1))
         encoder.setFragmentTexture(textureToDisplay, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
 
+        processedFrame = canCache ? (processingKey, textureToDisplay) : nil
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
@@ -289,12 +326,24 @@ final class Renderer: NSObject, MTKViewDelegate {
             // history so the previous video's frames can't linger on screen.
             previousSample = nil
             currentSample = nil
+            cachedInterpolation = nil
+            processedFrame = nil
+            opticalFlow.reset()
             return
         }
         guard frame.serial != lastFrameSerial,
-              let texture = makeColorTexture(from: frame.pixelBuffer) else {
+              let wrapped = makeColorTexture(from: frame.pixelBuffer) else {
             return
         }
+        if lastMediaGeneration != frame.generation {
+            previousSample = nil
+            currentSample = nil
+            processedFrame = nil
+            opticalFlow.reset()
+            lastMediaGeneration = frame.generation
+        }
+        let texture = wrapped.texture
+        cachedInterpolation = nil
         lastFrameSerial = frame.serial
         statReal += 1 // one count per *decoded* frame, not per display refresh
 
@@ -303,10 +352,14 @@ final class Renderer: NSObject, MTKViewDelegate {
             print("SuperResVideoPlayer: first video frame received (\(texture.width)x\(texture.height))")
         }
 
-        let newSample = FrameSample(pixelBuffer: frame.pixelBuffer, texture: texture, itemTimeSeconds: frame.timeSeconds)
+        let newSample = FrameSample(pixelBuffer: frame.pixelBuffer, texture: texture, cvTexture: wrapped.backing, itemTimeSeconds: frame.timeSeconds)
 
         // Ignore duplicate/backwards timestamps (can happen right after a seek).
-        if let current = currentSample, newSample.itemTimeSeconds <= current.itemTimeSeconds {
+        if let current = currentSample,
+           newSample.itemTimeSeconds <= current.itemTimeSeconds ||
+           newSample.itemTimeSeconds - current.itemTimeSeconds > 0.5 ||
+           texture.width != current.texture.width || texture.height != current.texture.height {
+            opticalFlow.reset()
             previousSample = nil
             currentSample = newSample
             return
@@ -356,6 +409,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             // catching up asynchronously) — show the nearer real frame
             // rather than stalling or showing a wrong-pair blend.
             return t < 0.5 ? previous.texture : current.texture
+        }
+
+        commandBuffer.addCompletedHandler { _ in
+            withExtendedLifetime(flow) { }
         }
 
         // Already synthesized this exact (pair, t) on an earlier display
@@ -446,7 +503,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: Frame -> Metal texture
 
-    private func makeColorTexture(from pixelBuffer: CVPixelBuffer) -> MTLTexture? {
+    private func makeColorTexture(from pixelBuffer: CVPixelBuffer) -> (texture: MTLTexture, backing: CVMetalTexture)? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
@@ -466,7 +523,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         guard status == kCVReturnSuccess, let cvTexture, let texture = CVMetalTextureGetTexture(cvTexture) else {
             return nil
         }
-        return texture
+        return (texture, cvTexture)
     }
 
     // MARK: MetalFX Super Resolution (unchanged from the initial version)

@@ -76,7 +76,10 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: AI Subtitle Generator state
 
-    @Published var subtitleCues: [SubtitleCue] = []
+    @Published var subtitleCues: [SubtitleCue] = [] {
+        didSet { subtitleTimeline = nil }
+    }
+    private var subtitleTimeline: SubtitleTimeline?
     @Published var subtitlesEnabled = true
     @Published var isGeneratingSubtitles = false
     @Published var subtitleGenerationProgress: Double = 0
@@ -103,7 +106,9 @@ final class PlayerViewModel: ObservableObject {
 
     /// Translated versions of `subtitleCues` (same timings, translated
     /// text). When non-empty, these are displayed and exported instead.
-    @Published var translatedCues: [SubtitleCue] = []
+    @Published var translatedCues: [SubtitleCue] = [] {
+        didSet { subtitleTimeline = nil }
+    }
 
     @Published var isTranslatingSubtitles = false
 
@@ -112,7 +117,8 @@ final class PlayerViewModel: ObservableObject {
         translatedCues.isEmpty ? subtitleCues : translatedCues
     }
 
-    private let subtitleGenerator = SubtitleGenerator()
+    private var subtitleGenerator = SubtitleGenerator()
+    private var subtitleGenerationTask: Task<Void, Never>?
 
     /// Extracts audio from containers the Speech framework can't read
     /// directly (it uses AVFoundation internally, so MKV etc. need their
@@ -166,12 +172,6 @@ final class PlayerViewModel: ObservableObject {
             guard let self else { return }
             self.playbackErrorMessage = "Couldn't play this video: \(message)"
             self.isPlaying = false
-        }
-
-        // Let the subtitle generator surface its internal phases (model
-        // download, transcription) in the status row.
-        subtitleGenerator.onStatus = { [weak self] status in
-            self?.statusMessage = status
         }
 
         Task { @MainActor in
@@ -269,6 +269,7 @@ final class PlayerViewModel: ObservableObject {
 
         // A new video invalidates any subtitles (and in-flight
         // transcription) generated for the previous one.
+        subtitleGenerationTask?.cancel()
         subtitleGenerator.cancel()
         mediaImporter.cancel()
         subtitleGenerationID += 1
@@ -324,11 +325,16 @@ final class PlayerViewModel: ObservableObject {
         subtitleGenerationProgress = 0
         subtitleGenerationID += 1
         let myGeneration = subtitleGenerationID
+        translationTask?.cancel()
+        translationID += 1
+        isTranslatingSubtitles = false
+        translatedCues = []
 
         let locale = subtitleLanguage
         let totalDuration = duration
 
-        Task { @MainActor in
+        subtitleGenerationTask = Task { @MainActor in
+            guard self.subtitleGenerationID == myGeneration, !Task.isCancelled else { return }
             // Extraction (when needed) is roughly the first 15% of the
             // progress bar; transcription fills the rest.
             func extractAudio() async throws -> URL {
@@ -341,7 +347,16 @@ final class PlayerViewModel: ObservableObject {
             }
 
             func transcribe(_ audioURL: URL, progressBase: Double) async throws -> [SubtitleCue] {
-                try await subtitleGenerator.generate(
+                try Task.checkCancellation()
+                // Isolate every attempt, including the extracted-audio retry,
+                // from late callbacks belonging to an earlier recognizer.
+                let generator = SubtitleGenerator()
+                self.subtitleGenerator = generator
+                generator.onStatus = { [weak self] status in
+                    guard let self, self.subtitleGenerationID == myGeneration else { return }
+                    self.statusMessage = status
+                }
+                return try await generator.generate(
                     for: audioURL,
                     locale: locale,
                     totalDuration: totalDuration
@@ -400,6 +415,7 @@ final class PlayerViewModel: ObservableObject {
 
     /// Stops an in-flight transcription (or the audio extraction preceding it).
     func cancelSubtitleGeneration() {
+        subtitleGenerationTask?.cancel()
         subtitleGenerator.cancel()
         mediaImporter.cancel()
         subtitleGenerationID += 1
@@ -436,6 +452,11 @@ final class PlayerViewModel: ObservableObject {
     }
 
     private func startVideoExport(source: URL, destination: URL, durationLimit: Double? = nil) {
+        guard source.resolvingSymlinksInPath().standardizedFileURL !=
+                destination.resolvingSymlinksInPath().standardizedFileURL else {
+            playbackErrorMessage = "Choose a destination other than the source video."
+            return
+        }
         isExportingVideo = true
         exportProgress = 0
         playbackErrorMessage = nil
@@ -508,7 +529,10 @@ final class PlayerViewModel: ObservableObject {
     /// (the translated line, when translation is active).
     func subtitleText(at time: Double) -> String? {
         guard subtitlesEnabled else { return nil }
-        return displayedSubtitleCues.first(where: { time >= $0.startTime && time <= $0.endTime })?.text
+        if subtitleTimeline == nil {
+            subtitleTimeline = SubtitleTimeline(cues: displayedSubtitleCues)
+        }
+        return subtitleTimeline?.text(at: time)
     }
 
     // MARK: Subtitle translation

@@ -35,9 +35,9 @@ final class MediaImporter {
     /// content, not the extension — files are often mislabeled (e.g. an
     /// .mkv renamed to .mp4 plays fine in mpv but is still Matroska inside).
     static func needsAudioExtraction(_ url: URL) -> Bool {
-        if let handle = try? FileHandle(forReadingFrom: url),
-           let header = try? handle.read(upToCount: 12) {
-            try? handle.close()
+        if let handle = try? FileHandle(forReadingFrom: url) {
+            defer { try? handle.close() }
+            let header = (try? handle.read(upToCount: 12)) ?? Data()
             // Matroska/WebM: EBML magic 1A 45 DF A3 at offset 0.
             if header.count >= 4, header.prefix(4) == Data([0x1A, 0x45, 0xDF, 0xA3]) {
                 return true
@@ -58,25 +58,56 @@ final class MediaImporter {
 
     private let workQueue = DispatchQueue(label: "SuperResVideoPlayer.MediaImporter", qos: .userInitiated)
     private let processLock = NSLock()
+    private let executableResolver: (String) -> String?
+
+    init(executableResolver: ((String) -> String?)? = nil) {
+        self.executableResolver = executableResolver ?? Self.findExecutable
+    }
     private var runningProcess: Process?
+    private var cancellationGeneration: UInt64 = 0
+
+    private func generationSnapshot() -> UInt64 {
+        processLock.lock()
+        defer { processLock.unlock() }
+        return cancellationGeneration
+    }
+
+    private func checkCancellation(_ generation: UInt64) throws {
+        guard generationSnapshot() == generation else { throw MediaImportError.cancelled }
+    }
+
+    private func start(_ process: Process, generation: UInt64) throws {
+        processLock.lock()
+        defer { processLock.unlock() }
+        guard cancellationGeneration == generation else { throw MediaImportError.cancelled }
+        try process.run()
+        runningProcess = process
+    }
+
+    private func clearRunningProcess() {
+        processLock.lock()
+        runningProcess = nil
+        processLock.unlock()
+    }
 
     /// Terminates any in-flight ffmpeg process. The awaiting `extractAudio`
     /// call then throws `MediaImportError.cancelled`.
     func cancel() {
         processLock.lock()
-        let process = runningProcess
+        cancellationGeneration &+= 1
+        if let process = runningProcess, process.isRunning { process.terminate() }
         processLock.unlock()
-        process?.terminate()
     }
 
     /// Extracts `url`'s first audio track to a temporary .m4a, reporting
     /// rough progress (0...1) on the main queue. Returns the cached output
     /// immediately if this exact file was extracted before.
     func extractAudio(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
+        let generation = generationSnapshot()
+        return try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
-                    continuation.resume(returning: try self.extractAudioSync(url: url, onProgress: onProgress))
+                    continuation.resume(returning: try self.extractAudioSync(url: url, generation: generation, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -90,10 +121,11 @@ final class MediaImporter {
     /// codecs via the VideoToolbox hardware encoder. Audio goes to AAC
     /// unless already MP4-compatible.
     func remuxVideoToMP4(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
+        let generation = generationSnapshot()
+        return try await withCheckedThrowingContinuation { continuation in
             workQueue.async {
                 do {
-                    continuation.resume(returning: try self.remuxVideoSync(url: url, onProgress: onProgress))
+                    continuation.resume(returning: try self.remuxVideoSync(url: url, generation: generation, onProgress: onProgress))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -101,8 +133,9 @@ final class MediaImporter {
         }
     }
 
-    private func remuxVideoSync(url: URL, onProgress: @escaping (Double) -> Void) throws -> URL {
-        guard let ffmpeg = Self.findExecutable("ffmpeg") else {
+    private func remuxVideoSync(url: URL, generation: UInt64, onProgress: @escaping (Double) -> Void) throws -> URL {
+        try checkCancellation(generation)
+        guard let ffmpeg = executableResolver("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
         }
 
@@ -111,14 +144,14 @@ final class MediaImporter {
             return outputURL
         }
 
-        let info = probe(url: url)
+        let info = probe(url: url, generation: generation)
         let copyableVideo: Set<String> = ["h264", "hevc"]
         let copyableAudio: Set<String> = ["aac", "mp3", "alac", "ac3", "eac3"]
         let videoCopy = info.videoCodec.map { copyableVideo.contains($0) } ?? false
         let audioCopy = info.audioCodec.map { copyableAudio.contains($0) } ?? false
 
-        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("part.mp4")
-        try? FileManager.default.removeItem(at: partialURL)
+        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("\(UUID().uuidString).part.mp4")
+        defer { try? FileManager.default.removeItem(at: partialURL) }
 
         func arguments(videoCopy: Bool, audioCopy: Bool) -> [String] {
             var args = [
@@ -139,7 +172,7 @@ final class MediaImporter {
 
         do {
             try runFFmpeg(arguments: arguments(videoCopy: videoCopy, audioCopy: audioCopy),
-                          ffmpegPath: ffmpeg, durationSeconds: info.duration, onProgress: onProgress)
+                          ffmpegPath: ffmpeg, generation: generation, durationSeconds: info.duration, onProgress: onProgress)
         } catch let error as MediaImportError {
             if case .cancelled = error {
                 try? FileManager.default.removeItem(at: partialURL)
@@ -153,15 +186,20 @@ final class MediaImporter {
             // transcode before giving up.
             try? FileManager.default.removeItem(at: partialURL)
             try runFFmpeg(arguments: arguments(videoCopy: false, audioCopy: false),
-                          ffmpegPath: ffmpeg, durationSeconds: info.duration, onProgress: onProgress)
+                          ffmpegPath: ffmpeg, generation: generation, durationSeconds: info.duration, onProgress: onProgress)
         }
 
-        try FileManager.default.moveItem(at: partialURL, to: outputURL)
+        try checkCancellation(generation)
+        // Another importer may have populated the shared cache meanwhile.
+        if !FileManager.default.fileExists(atPath: outputURL.path) {
+            try FileManager.default.moveItem(at: partialURL, to: outputURL)
+        }
         return outputURL
     }
 
-    private func extractAudioSync(url: URL, onProgress: @escaping (Double) -> Void) throws -> URL {
-        guard let ffmpeg = Self.findExecutable("ffmpeg") else {
+    private func extractAudioSync(url: URL, generation: UInt64, onProgress: @escaping (Double) -> Void) throws -> URL {
+        try checkCancellation(generation)
+        guard let ffmpeg = executableResolver("ffmpeg") else {
             throw MediaImportError.ffmpegNotFound
         }
 
@@ -170,7 +208,7 @@ final class MediaImporter {
             return outputURL
         }
 
-        let info = probe(url: url)
+        let info = probe(url: url, generation: generation)
 
         // AAC/ALAC can be stream-copied into .m4a losslessly; everything
         // else (FLAC, Opus, AC-3, ...) is transcoded to AAC — still fast,
@@ -180,8 +218,8 @@ final class MediaImporter {
 
         // Write to a partial file and rename on success, so a cancelled or
         // failed extraction never leaves a truncated file in the cache.
-        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("part.m4a")
-        try? FileManager.default.removeItem(at: partialURL)
+        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("\(UUID().uuidString).part.m4a")
+        defer { try? FileManager.default.removeItem(at: partialURL) }
 
         var args = [
             "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
@@ -192,20 +230,25 @@ final class MediaImporter {
         args += ["-movflags", "+faststart", partialURL.path]
 
         do {
-            try runFFmpeg(arguments: args, ffmpegPath: ffmpeg,
+            try runFFmpeg(arguments: args, ffmpegPath: ffmpeg, generation: generation,
                           durationSeconds: info.duration, onProgress: onProgress)
         } catch {
             try? FileManager.default.removeItem(at: partialURL)
             throw error
         }
 
-        try FileManager.default.moveItem(at: partialURL, to: outputURL)
+        try checkCancellation(generation)
+        // Another importer may have populated the shared cache meanwhile.
+        if !FileManager.default.fileExists(atPath: outputURL.path) {
+            try FileManager.default.moveItem(at: partialURL, to: outputURL)
+        }
         return outputURL
     }
 
     private func runFFmpeg(
         arguments: [String],
         ffmpegPath: String,
+        generation: UInt64,
         durationSeconds: Double,
         onProgress: @escaping (Double) -> Void
     ) throws {
@@ -225,14 +268,16 @@ final class MediaImporter {
             guard !data.isEmpty else { return }
             logLock.lock()
             errorLog.append(data)
+            if errorLog.count > 65_536 { errorLog = Data(errorLog.suffix(65_536)) }
             logLock.unlock()
         }
 
         // `-progress pipe:1` emits key=value lines; out_time_us is the
         // current output timestamp in microseconds.
         stdout.fileHandleForReading.readabilityHandler = { handle in
-            guard durationSeconds > 0,
-                  let text = String(data: handle.availableData, encoding: .utf8) else { return }
+            let data = handle.availableData // Drain even when progress cannot be calculated.
+            guard durationSeconds.isFinite, durationSeconds > 0,
+                  let text = String(data: data, encoding: .utf8) else { return }
             for line in text.split(separator: "\n") where line.hasPrefix("out_time_us=") {
                 if let us = Double(line.dropFirst("out_time_us=".count)) {
                     let progress = min(1.0, max(0.0, (us / 1_000_000) / durationSeconds))
@@ -241,20 +286,15 @@ final class MediaImporter {
             }
         }
 
-        processLock.lock()
-        runningProcess = process
-        processLock.unlock()
-
         defer {
-            processLock.lock()
-            runningProcess = nil
-            processLock.unlock()
+            clearRunningProcess()
             stdout.fileHandleForReading.readabilityHandler = nil
             stderr.fileHandleForReading.readabilityHandler = nil
         }
 
-        try process.run()
+        try start(process, generation: generation)
         process.waitUntilExit()
+        try checkCancellation(generation)
 
         if process.terminationReason == .uncaughtSignal {
             throw MediaImportError.cancelled
@@ -277,9 +317,9 @@ final class MediaImporter {
 
     /// Asks ffprobe what's inside the file. Failing softly just means the
     /// audio gets transcoded rather than stream-copied.
-    private func probe(url: URL) -> ProbeInfo {
+    private func probe(url: URL, generation: UInt64) -> ProbeInfo {
         let fallback = ProbeInfo(videoCodec: nil, audioCodec: nil, duration: 0)
-        guard let ffprobe = Self.findExecutable("ffprobe") else { return fallback }
+        guard let ffprobe = executableResolver("ffprobe") else { return fallback }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ffprobe)
@@ -291,7 +331,8 @@ final class MediaImporter {
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
 
-        do { try process.run() } catch { return fallback }
+        do { try start(process, generation: generation) } catch { return fallback }
+        defer { clearRunningProcess() }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0,

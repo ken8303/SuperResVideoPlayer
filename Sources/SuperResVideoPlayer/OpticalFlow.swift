@@ -32,8 +32,16 @@ final class OpticalFlowEstimator {
     /// here would be a real (if intermittent) ARC-related race, not just a
     /// style nit. `stateLock` guards both `_latestResult` and `_isComputing`.
     private let stateLock = NSLock()
-    private var _latestResult: (motionTexture: MTLTexture, flowBuffer: CVPixelBuffer, previousTime: Double, currentTime: Double)?
+    private var _latestResult: (motionTexture: MTLTexture, cvTexture: CVMetalTexture, flowBuffer: CVPixelBuffer, previousTime: Double, currentTime: Double)?
     private var _isComputing = false
+    private var generation: UInt64 = 0
+
+    func reset() {
+        stateLock.lock()
+        generation &+= 1
+        _latestResult = nil
+        stateLock.unlock()
+    }
 
     /// Latest computed motion texture (rg32Float, one (dx, dy) pixel-space
     /// vector per source pixel) plus the pair of source-frame timestamps it
@@ -43,7 +51,7 @@ final class OpticalFlowEstimator {
     /// wrap of Vision's own CVPixelBuffer — retaining the buffer for as long
     /// as the texture is in use keeps the underlying memory alive while the
     /// GPU samples it. Safe to read from any thread.
-    var latestResult: (motionTexture: MTLTexture, flowBuffer: CVPixelBuffer, previousTime: Double, currentTime: Double)? {
+    var latestResult: (motionTexture: MTLTexture, cvTexture: CVMetalTexture, flowBuffer: CVPixelBuffer, previousTime: Double, currentTime: Double)? {
         stateLock.lock()
         defer { stateLock.unlock() }
         return _latestResult
@@ -68,6 +76,7 @@ final class OpticalFlowEstimator {
             return
         }
         _isComputing = true
+        let requestGeneration = generation
         stateLock.unlock()
 
         queue.async { [weak self] in
@@ -89,7 +98,9 @@ final class OpticalFlowEstimator {
                 let flowBuffer = observation.pixelBuffer
                 if let texture = self.makeTexture(from: flowBuffer) {
                     self.stateLock.lock()
-                    self._latestResult = (texture, flowBuffer, previousTime, currentTime)
+                    if self.generation == requestGeneration {
+                        self._latestResult = (texture.texture, texture.backing, flowBuffer, previousTime, currentTime)
+                    }
                     self.stateLock.unlock()
                 }
             } catch {
@@ -102,7 +113,7 @@ final class OpticalFlowEstimator {
         }
     }
 
-    private func makeTexture(from pixelBuffer: CVPixelBuffer) -> MTLTexture? {
+    private func makeTexture(from pixelBuffer: CVPixelBuffer) -> (texture: MTLTexture, backing: CVMetalTexture)? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
@@ -127,6 +138,6 @@ final class OpticalFlowEstimator {
         // caller stores the CVPixelBuffer alongside this texture in
         // `_latestResult` to satisfy that (same reason Renderer's
         // FrameSample retains its pixelBuffer for color frames).
-        return texture
+        return (texture, cvTexture)
     }
 }

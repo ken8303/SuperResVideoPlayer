@@ -139,20 +139,21 @@ final class FrameInterpolator {
         let depthDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r32Float, width: width, height: height, mipmapped: false
         )
-        depthDescriptor.usage = newInterpolator.depthTextureUsage
+        depthDescriptor.usage = newInterpolator.depthTextureUsage.union(.shaderWrite)
         depthDescriptor.storageMode = .private
         guard let newDepthTexture = device.makeTexture(descriptor: depthDescriptor) else { return false }
 
         let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
         )
-        outputDescriptor.usage = newInterpolator.outputTextureUsage
+        outputDescriptor.usage = newInterpolator.outputTextureUsage.union(.shaderRead)
         outputDescriptor.storageMode = .private
         guard let newOutputTexture = device.makeTexture(descriptor: outputDescriptor) else { return false }
 
         // Fill the depth texture once with a flat/constant value (see the
         // class doc comment on why video has no real depth to provide).
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        do {
             encoder.setComputePipelineState(clearDepthPipeline)
             encoder.setTexture(newDepthTexture, index: 0)
             let threadsPerGroup = MTLSize(width: 16, height: 16, depth: 1)
