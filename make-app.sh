@@ -28,12 +28,12 @@ SCRATCH="${TMPDIR:-/tmp}"
 SCRATCH="${SCRATCH%/}/SuperResVideoPlayer-build"   # TMPDIR ends in "/" on macOS
 mkdir -p "$SCRATCH"
 
-swift build --scratch-path "$SCRATCH" -Xswiftc -gnone
+swift build --scratch-path "$SCRATCH" -Xswiftc -gnone "$@"
 
 # Ask SwiftPM where it actually put the products: the layout differs between
 # build systems ("debug/" for the native one, "out/Products/Debug/" for the
 # Xcode one) and the default has changed between toolchains.
-BIN_DIR="$(swift build --scratch-path "$SCRATCH" -Xswiftc -gnone --show-bin-path)"
+BIN_DIR="$(swift build --scratch-path "$SCRATCH" -Xswiftc -gnone "$@" --show-bin-path)"
 BIN="$BIN_DIR/SuperResVideoPlayer"
 BUNDLE_SRC="$BIN_DIR/SuperResVideoPlayer_SuperResVideoPlayer.bundle"
 # The .app is assembled and signed in the scratch dir too — signing it
@@ -46,15 +46,54 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/SuperResVideoPlayer"
 cp Info.plist "$APP/Contents/Info.plist"
 
+# Optional standalone conversion tools for local testing without Homebrew.
+# Preserve helpers from the persistent testing app on subsequent rebuilds.
+HELPERS_DIR="${SRV_HELPERS_DIR:-${SRV_APP_OUTPUT:-}/Contents/Helpers}"
+if [ -n "${SRV_HELPERS_DIR:-}" ] && [ ! -d "$HELPERS_DIR" ]; then
+  echo "Missing SRV_HELPERS_DIR: $HELPERS_DIR" >&2
+  exit 1
+fi
+if [ -d "$HELPERS_DIR" ]; then
+  mkdir -p "$APP/Contents/Helpers"
+  for helper in ffmpeg ffprobe; do
+    if [ ! -x "$HELPERS_DIR/$helper" ]; then
+      echo "Missing executable helper: $HELPERS_DIR/$helper" >&2
+      exit 1
+    fi
+    ditto --norsrc "$HELPERS_DIR/$helper" "$APP/Contents/Helpers/$helper"
+    codesign --force --sign - "$APP/Contents/Helpers/$helper"
+  done
+fi
+
 # SPM resource bundle (compiled shaders etc.) — Bundle.module looks for it
 # in Contents/Resources.
 if [ -d "$BUNDLE_SRC" ]; then
   cp -R "$BUNDLE_SRC" "$APP/Contents/Resources/"
 fi
 
+# Match the release app icon in local testing builds.
+if [ -f AppIcon.png ]; then
+  ICONSET="$SCRATCH/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" AppIcon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+    sips -z "$((size * 2))" "$((size * 2))" AppIcon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+fi
+
 # Ad-hoc signature: enough for local use; TCC and system services want
 # *some* stable code identity.
 codesign --force --sign - "$APP"
+
+codesign --verify --deep "$APP"
+
+# Optionally publish the signed testing app to a persistent destination.
+if [ -n "${SRV_APP_OUTPUT:-}" ] && [ "$SRV_APP_OUTPUT" != "$APP" ]; then
+  mkdir -p "$(dirname "$SRV_APP_OUTPUT")"
+  ditto --norsrc "$APP" "$SRV_APP_OUTPUT"
+  APP="$SRV_APP_OUTPUT"
+fi
 
 echo "Built $APP"
 

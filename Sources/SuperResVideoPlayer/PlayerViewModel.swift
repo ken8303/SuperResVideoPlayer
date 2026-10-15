@@ -992,7 +992,7 @@ final class PlayerViewModel: ObservableObject {
                 self.statusMessage = nil
                 print("SuperResVideoPlayer: translation finished (\(untranslated) line(s) skipped)")
                 if untranslated > 0 {
-                    self.subtitleErrorMessage = "\(untranslated) line(s) kept their original text (blocked by the on-device model's content filter)."
+                    self.subtitleErrorMessage = "\(untranslated) line(s) could not be reliably translated and kept their original text. Try translating again."
                 }
             } catch is CancellationError {
                 // Superseded by a newer request or switched off.

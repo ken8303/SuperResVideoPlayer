@@ -5,6 +5,42 @@ import Metal
 @testable import SuperResVideoPlayer
 
 final class RegressionTests: XCTestCase {
+    func testTranslationRejectsLanguageDriftAndBilingualOutput() {
+        XCTAssertFalse(TranslationLanguageValidator.accepts("The Sect Master, the Wandering Mountain Immortal Crane.", target: "ja"))
+        XCTAssertFalse(TranslationLanguageValidator.accepts("Hurry up.", target: "ja"))
+        XCTAssertFalse(TranslationLanguageValidator.accepts("追赶这个男人叫小光|追いかけている男は小光です。", target: "ja"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("宗主、山を渡る仙鶴です。", target: "ja"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("急いで。", target: "ja"))
+        XCTAssertFalse(TranslationLanguageValidator.accepts("急いでください。」}```json```{", target: "ja"))
+        XCTAssertFalse(TranslationLanguageValidator.accepts("宗主、さまよう山霊の鶴。}, {", target: "ja"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("宗主", target: "ja"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("AI", target: "ja"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("123…", target: "ja"))
+        XCTAssertFalse(TranslationLanguageValidator.accepts("急いでください。", target: "en"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("The Sect Master has arrived.", target: "en"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("宗主已經到了，請大家安靜。", target: "zh-Hant"))
+        XCTAssertTrue(TranslationLanguageValidator.accepts("빨리 돌아가야 합니다.", target: "ko"))
+    }
+
+    func testLiveJapaneseTranslationWhenRequested() async throws {
+        guard ProcessInfo.processInfo.environment["SRV_TEST_LIVE_TRANSLATION"] == "1" else {
+            throw XCTSkip("Opt-in on-device model smoke test")
+        }
+        let cues = [
+            SubtitleCue(startTime: 1129.5, endTime: 1133.37, text: "The Sect Master, the Wandering Mountain Immortal Crane."),
+            SubtitleCue(startTime: 1133.94, endTime: 1139.19, text: "Hurry up.")
+        ]
+        let skipped = try await SubtitleTranslator.translate(cues: cues, sourceLocale: Locale(identifier: "en"), targetIdentifier: "ja") { updates, completed in
+            XCTAssertEqual(completed, 2)
+            XCTAssertEqual(updates.count, 2)
+            for text in updates.values {
+                XCTAssertTrue(TranslationLanguageValidator.accepts(text, target: "ja"))
+                print("Japanese translation smoke test: \(text)")
+            }
+        }
+        XCTAssertEqual(skipped, 0)
+    }
+
     private enum ExpectedFailure: Error { case failed }
 
     private func temporaryDirectory() throws -> URL {

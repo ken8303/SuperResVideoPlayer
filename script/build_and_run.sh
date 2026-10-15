@@ -7,11 +7,11 @@ BUNDLE_ID="io.github.ken8303.SuperResVideoPlayer"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH="${TMPDIR:-/tmp}"
 SCRATCH="${SCRATCH%/}/SuperResVideoPlayer-build"
-APP_BUNDLE="$SCRATCH/$APP_NAME.app"
+APP_BUNDLE="${SRV_APP_OUTPUT:-$SCRATCH/$APP_NAME.app}"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
-SRV_BUILD_ONLY=1 bash "$ROOT_DIR/make-app.sh"
+SRV_BUILD_ONLY=1 bash "$ROOT_DIR/make-app.sh" "${@:2}"
 
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
