@@ -5,6 +5,15 @@ import CoreGraphics
 /// number" formulas can be unit-tested independently of Metal/AVFoundation.
 public enum VideoMath {
 
+    /// Display one frame behind: at the current frame's arrival show the
+    /// previous frame, then advance at the host clock rate until the next.
+    public static func interpolationPhase(now: Double, arrival: Double, interval: Double, multiplier: Int) -> Double {
+        guard now.isFinite, arrival.isFinite, interval.isFinite,
+              interval > 0, interval <= 0.5, multiplier > 1 else { return 1 }
+        let phase = min(1, max(0, (now - arrival) / interval))
+        return floor(phase * Double(multiplier)) / Double(multiplier)
+    }
+
     /// Metal 2D-texture side limit on Apple-family GPUs.
     public static let maxTextureDimension = 16384
 

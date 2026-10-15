@@ -4,8 +4,8 @@ Survey a video library to decide whether a hybrid AVFoundation/libmpv decode
 path is worth building for HDR support.
 
 Background: SuperResVideoPlayer renders through mpv's *software* render API,
-which outputs 8 bits per channel, so HDR sources are tone-mapped to SDR before
-the Metal pipeline sees them. VideoToolbox, by contrast, decodes HDR straight
+which requests 16-bit RGBA with an 8-bit fallback. This software path does
+not guarantee HDR transfer preservation or colour-managed tone mapping. VideoToolbox, by contrast, decodes HDR straight
 to 10-bit CVPixelBuffers — but only for containers AVFoundation can open
 (essentially MP4/MOV/M4V, not MKV/WebM/AVI).
 

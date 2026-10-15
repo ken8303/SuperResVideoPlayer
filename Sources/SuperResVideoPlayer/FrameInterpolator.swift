@@ -23,13 +23,6 @@ import MetalFX
 ///    project only uses it for the 2x case; 3x falls back to a custom warp
 ///    (see `Shaders.metal` / `Renderer.swift`).
 ///
-/// The property names below were cross-checked against the actual
-/// `MTLFXFrameInterpolator.h`/`MTLFXFrameInterpolatorDescriptor` header diff
-/// for the Xcode 26 SDK (found via web search, since this sandbox has no
-/// macOS/Metal toolchain to compile against directly), so they should be
-/// accurate as of that SDK. Still worth a quick diff against your local
-/// `MetalFX.framework/Headers/MTLFXFrameInterpolator.h` if anything fails to
-/// compile, since this remains a very new API.
 final class FrameInterpolator {
 
     private let device: MTLDevice

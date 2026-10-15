@@ -1,3 +1,18 @@
+## Unreleased correctness follow-up
+
+The HDR passthrough/BT.2390 claim below is superseded: mpv's software-render
+API does not establish those pixel transformations. Playback stays on an SDR
+layer and reports HDR colour mapping as unverified. A 16-bit buffer alone does
+not provide verified HDR rendering. See README for current limitations.
+
+Interpolation now uses elapsed host time, export preserves colour/pixel aspect
+metadata and trims leading audio, FFmpeg readers drain to EOF, and text
+subtitles are composited outside enhancement. Translation receives prior
+source context and mpv client calls are serialized with handle retirement.
+
+The historical test count below applies to that release; current verification
+is recorded in the review report and test log.
+
 # SuperRes Video Player 1.3
 
 A native macOS video player that plays almost anything and enhances video in

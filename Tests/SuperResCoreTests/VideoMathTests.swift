@@ -3,6 +3,18 @@ import CoreGraphics
 @testable import SuperResCore
 
 final class VideoMathTests: XCTestCase {
+    func testInterpolationUsesElapsedHostTimeOneFrameBehind() {
+        let interval = 1.0 / 24
+        XCTAssertEqual(VideoMath.interpolationPhase(now: 10, arrival: 10, interval: interval, multiplier: 2), 0)
+        XCTAssertEqual(VideoMath.interpolationPhase(now: 10 + interval * 0.6, arrival: 10, interval: interval, multiplier: 2), 0.5)
+        XCTAssertEqual(VideoMath.interpolationPhase(now: 10 + interval * 1.1, arrival: 10, interval: interval, multiplier: 2), 1)
+        XCTAssertEqual(VideoMath.interpolationPhase(now: 9, arrival: 10, interval: interval, multiplier: 3), 0)
+        XCTAssertEqual(VideoMath.interpolationPhase(now: 10 + interval * 0.8, arrival: 10, interval: interval, multiplier: 3), 2.0 / 3)
+        XCTAssertEqual(VideoMath.interpolationPhase(now: .nan, arrival: 10, interval: interval, multiplier: 2), 1)
+        XCTAssertEqual(VideoMath.interpolationPhase(now: 10, arrival: 10, interval: 0, multiplier: 2), 1)
+        XCTAssertEqual(VideoMath.interpolationPhase(now: 10, arrival: 10, interval: 2, multiplier: 2), 1)
+    }
+
 
     func testHDRPassthroughRequiresHDRHighBitDepthAndDisplayHeadroom() {
         XCTAssertTrue(VideoMath.shouldAttemptHDRPassthrough(

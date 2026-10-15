@@ -98,30 +98,7 @@ final class PlayerViewModel: ObservableObject {
     /// True while the HDR signal is being passed through to the display
     /// rather than tone-mapped. Drives the layer's colour space.
     @Published private(set) var hdrOutputActive = false
-
-    /// Whether any attached display can actually show more than SDR white.
-    ///
-    /// This gates HDR passthrough, and its absence was a real bug: handing
-    /// PQ to a display with no extended range doesn't produce HDR, it
-    /// *clips* — highlights slam to white while everything else looks
-    /// roughly normal. Every log line said HDR was working; the picture
-    /// disagreed, because the display had nowhere to put the extra range.
-    ///
-    /// `maximumPotential…` is the right property: it reports what the
-    /// display can do, rather than the headroom available at this instant
-    /// (which drops when the panel is bright or warm).
-    static var displaySupportsHDR: Bool {
-        VideoMath.shouldAttemptHDRPassthrough(
-            sourceIsHDR: true,
-            usingHighBitDepth: true,
-            displayHeadroom: maximumDisplayHeadroom)
-    }
-
-    private static var maximumDisplayHeadroom: Double {
-        Double(NSScreen.screens
-            .map(\.maximumPotentialExtendedDynamicRangeColorComponentValue)
-            .max() ?? 1.0)
-    }
+    @Published private(set) var embeddedSubtitleText = ""
 
     /// One-line note shown in the UI for HDR sources — either confirming HDR
     /// is reaching the display, or explaining the tone-map. nil for SDR.
@@ -129,7 +106,7 @@ final class PlayerViewModel: ObservableObject {
         guard let colorInfo, colorInfo.isHDR else { return nil }
         return hdrOutputActive
             ? "\(colorInfo.description) — HDR output"
-            : "\(colorInfo.description) — tone-mapped to SDR"
+            : "\(colorInfo.description) — SDR software output (HDR colour mapping unverified)"
     }
 
     /// One-line description of whatever long-running background work is in
@@ -397,36 +374,16 @@ final class PlayerViewModel: ObservableObject {
             guard self.colorInfo != info else { return }
             self.colorInfo = info
 
-            // HDR passthrough is only safe on the 16-bit path — PQ at 8 bits
-            // per channel bands badly, so tone-map instead if libmpv fell
-            // back to the 8-bit format.
-            let wantPassThrough = VideoMath.shouldAttemptHDRPassthrough(
-                sourceIsHDR: info.isHDR,
-                usingHighBitDepth: self.mpv.usingHighBitDepth,
-                displayHeadroom: Self.maximumDisplayHeadroom)
-            // Only claim HDR if mpv confirms it accepted the PQ target —
-            // otherwise the layer would be tagged PQ while mpv is still
-            // sending SDR, which looks badly wrong.
-            let accepted = self.mpv.setHDRPassthrough(wantPassThrough)
-            self.hdrOutputActive = accepted
-
-            if info.isHDR {
-                let headroom = Self.maximumDisplayHeadroom
-                let reason: String
-                if accepted {
-                    reason = "HDR output active"
-                } else if !Self.displaySupportsHDR {
-                    reason = String(format: "tone-mapped to SDR (display headroom %.2f — no extended range)", headroom)
-                } else if !self.mpv.usingHighBitDepth {
-                    reason = "tone-mapped to SDR (8-bit render path)"
-                } else {
-                    reason = "tone-mapped to SDR"
-                }
-                print("SuperResVideoPlayer: \(info.description) — \(reason)")
-            }
+            // Software-renderer RGB has no verified PQ contract. Do not
+            // derive pixel encoding from GPU option readback or screen EDR.
+            self.hdrOutputActive = self.mpv.setHDRPassthrough(false)
+        }
+        mpv.onSubtitleTextChanged = { [weak self] text in
+            self?.embeddedSubtitleText = text
         }
         mpv.onTracksChanged = { [weak self] tracks in
             guard let self else { return }
+            self.embeddedSubtitleText = ""
             self.audioTracks = tracks.filter { $0.kind == .audio }
             self.subtitleTracks = tracks.filter { $0.kind == .sub }
             // Reflect whatever mpv auto-selected so the pickers open on the
@@ -923,12 +880,16 @@ final class PlayerViewModel: ObservableObject {
     /// Returns the AI subtitle line that should be visible at `time`, if any
     /// (the translated line, when translation is active).
     ///
-    /// Suppressed while an embedded subtitle track is active: mpv burns
-    /// those into the frame itself, so showing the AI overlay too would
-    /// stack two lines of text on top of each other. Selecting "Off" for the
-    /// embedded track brings the AI overlay straight back.
+    /// Embedded text tracks take priority over generated cues and are drawn
+    /// after enhancement. Bitmap tracks stay in mpv's frame and suppress
+    /// this overlay. Selecting Off restores the generated subtitle timeline.
     func subtitleText(at time: Double) -> String? {
-        guard subtitlesEnabled, currentSubtitleTrackID == 0 else { return nil }
+        guard subtitlesEnabled else { return nil }
+        if currentSubtitleTrackID != 0 {
+            guard subtitleTracks.contains(where: { $0.id == currentSubtitleTrackID && $0.isTextSubtitle }),
+                  !embeddedSubtitleText.isEmpty else { return nil }
+            return embeddedSubtitleText
+        }
         if subtitleTimeline == nil {
             subtitleTimeline = SubtitleTimeline(cues: displayedSubtitleCues)
         }

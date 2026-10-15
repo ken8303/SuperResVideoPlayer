@@ -288,7 +288,7 @@ struct ContentView: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .help("HDR uses the 16-bit playback pipeline when supported. On displays without extended range—or if libmpv falls back to 8-bit—the source is tone-mapped with BT.2390 and per-scene peak detection.")
+                    .help("The software renderer uses SDR presentation. HDR colour mapping is not verified; highlights and colours may be inaccurate.")
             }
 
             // Audio-track / embedded-subtitle pickers appear only when the

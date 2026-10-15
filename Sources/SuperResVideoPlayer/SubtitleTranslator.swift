@@ -91,8 +91,11 @@ enum SubtitleTranslator {
                 let numberedLines = range
                     .map { "\($0 - batchStart + 1)|\(cues[$0].text)" }
                     .joined(separator: "\n")
+                let context = cues[max(0, batchStart - 3)..<batchStart]
+                    .map(\.text).joined(separator: "\n")
+                let prompt = "Read-only preceding dialogue (do not translate or output):\n<context>\n\(context)\n</context>\nTranslate only these numbered cues:\n\(numberedLines)"
                 let response = try await makeSession(sourceName: sourceName, targetName: targetName)
-                    .respond(to: numberedLines, generating: TranslatedSubtitleBatch.self,
+                    .respond(to: prompt, generating: TranslatedSubtitleBatch.self,
                              options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: 2048))
 
                 let lines = response.content.lines

@@ -68,7 +68,7 @@ from source instead.
   here — `MTLFXFrameInterpolator` (Metal 4), SpeechAnalyzer, Foundation
   Models — all shipped in macOS 26. macOS 27 is still worth having for its
   improved on-device translation model, but nothing requires it.
-- Xcode 27+ / a Swift 6.2+ toolchain to build.
+- Xcode 27+ / a Swift 6.4+ toolchain to build.
 - **libmpv**: `brew install mpv`
 - **ffmpeg**: `brew install ffmpeg` — required for *subtitle generation on
   video files* (the speech engines read via `AVAudioFile`, which can't
@@ -134,7 +134,7 @@ libmpv (demux + decode + audio + A/V sync)
 - Subtitles: audio is transcribed on-device (extracted first to a temp
   16 kHz mono WAV — the selected audio track, not blindly the first); word
   timings are grouped into cues by a pause/length heuristic (CJK-aware). Translation rewrites cue text in
-  batches of 15 through the on-device language model, with per-line retry
+  batches of 8 through the on-device language model, with per-line retry
   when a batch is rejected or garbled.
 - Export: `AVAssetReader` → the same Metal pipeline (flow computed per
   pair, synchronously) → `AVAssetWriter` (HEVC, writer-driven
@@ -157,10 +157,11 @@ libmpv (demux + decode + audio + A/V sync)
   following along, not fansub grade. A few lines may be skipped by the
   model's content filter (they keep the original text; the UI reports how
   many).
-- The video render path is 16-bit RGBA. HDR10/HLG sources are passed
-  through as PQ to a display with extended dynamic range, and tone-mapped
-  (BT.2390) otherwise — including on "HDR ready" monitors whose actual peak
-  brightness is around SDR levels, where passthrough would just clip.
+- The software video render path requests 16-bit RGBA, with an 8-bit
+  fallback. This does not establish HDR passthrough or BT.2390 tone mapping:
+  mpv's GPU tone-mapping options are not a contract for software RGB output.
+  The layer remains SDR. HDR highlights/colours may be inaccurate; verified
+  HDR playback and export require an explicit colour-managed pipeline.
 
 ## File map
 
@@ -221,3 +222,17 @@ required by these tests.
 Playback caches enhancement/upscale output for repeated decoded frames when
 interpolation is off. This avoids rerunning those GPU passes at the display
 refresh rate (including while paused); drawing still follows the display clock.
+
+### Playback review follow-up
+
+- Interpolation runs one frame behind using host-clock arrivals and mpv's
+  next-frame target time; audio receives a matching one-frame delay.
+- Embedded text subtitles use the final SwiftUI overlay, outside enhancement
+  and optical flow. ASS positioning/style is reduced to plain text. Bitmap
+  subtitles remain burned into mpv frames and can still be distorted by flow.
+- Export preserves source SDR colour tags (BT.709 defaults when absent) and
+  pixel aspect ratio, and trims audio preceding the first video frame.
+- Translation includes the preceding three source cues as read-only context.
+- Export still waits for each GPU frame. Overlapping work requires separate
+  output/intermediate textures per in-flight frame and measured profiling;
+  it is not enabled by this correctness update.

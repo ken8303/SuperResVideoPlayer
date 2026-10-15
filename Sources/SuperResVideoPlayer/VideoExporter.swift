@@ -98,6 +98,8 @@ final class VideoExporter: @unchecked Sendable {
         let audioChannels: Int
         let audioSampleRate: Double
         let preferredTransform: CGAffineTransform
+        let colorProperties: [String: String]
+        let pixelAspectRatio: [String: Int]
     }
 
     func export(
@@ -139,6 +141,20 @@ final class VideoExporter: @unchecked Sendable {
                 "HDR export needs color-managed tone mapping; playback is unaffected.")
         }
 
+        let extensions = videoFormats.first.flatMap { CMFormatDescriptionGetExtensions($0) } as NSDictionary?
+        let colorProperties = [
+            AVVideoColorPrimariesKey: extensions?[kCMFormatDescriptionExtension_ColorPrimaries] as? String ?? AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: extensions?[kCMFormatDescriptionExtension_TransferFunction] as? String ?? AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey: extensions?[kCMFormatDescriptionExtension_YCbCrMatrix] as? String ?? AVVideoYCbCrMatrix_ITU_R_709_2
+        ]
+        let sourceAspect = extensions?[kCMFormatDescriptionExtension_PixelAspectRatio] as? NSDictionary
+        let horizontal = (sourceAspect?[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing] as? NSNumber)?.intValue ?? 1
+        let vertical = (sourceAspect?[kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing] as? NSNumber)?.intValue ?? 1
+        let pixelAspectRatio = [
+            AVVideoPixelAspectRatioHorizontalSpacingKey: max(1, horizontal),
+            AVVideoPixelAspectRatioVerticalSpacingKey: max(1, vertical)
+        ]
+
         var audioChannels = 2
         var audioSampleRate = 48000.0
         if let audioTrack {
@@ -158,7 +174,9 @@ final class VideoExporter: @unchecked Sendable {
             sourceFPS: Double(nominalFPS > 0 ? nominalFPS : 30),
             audioChannels: audioChannels,
             audioSampleRate: audioSampleRate,
-            preferredTransform: preferredTransform
+            preferredTransform: preferredTransform,
+            colorProperties: colorProperties,
+            pixelAspectRatio: pixelAspectRatio
         )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -330,6 +348,8 @@ final class VideoExporter: @unchecked Sendable {
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: outWidth,
             AVVideoHeightKey: outHeight,
+            AVVideoColorPropertiesKey: info.colorProperties,
+            AVVideoPixelAspectRatioKey: info.pixelAspectRatio,
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: bitrate,
                 AVVideoExpectedSourceFrameRateKey: Int(outputFPS.rounded())
@@ -700,7 +720,22 @@ final class VideoExporter: @unchecked Sendable {
                         return
                     }
                     // Shift audio to the same zero-based timeline as video.
-                    let adjusted = Self.offsetSampleTimestamps(sample, by: timeOffset) ?? sample
+                    // PCM packets entirely before the first video frame are
+                    // discarded; crossing packets are trimmed at sample precision.
+                    let trimmed: CMSampleBuffer
+                    do {
+                        guard let kept = try Self.trimAudio(sample, startingAt: timeOffset) else { continue }
+                        trimmed = kept
+                    } catch {
+                        audioInput.markAsFinished()
+                        fail(error)
+                        return
+                    }
+                    guard let adjusted = Self.offsetSampleTimestamps(trimmed, by: timeOffset) else {
+                        audioInput.markAsFinished()
+                        fail(VideoExportError.processingFailed("Couldn't normalize audio timestamps."))
+                        return
+                    }
                     if !audioInput.append(adjusted) {
                         audioInput.markAsFinished()
                         fail(VideoExportError.processingFailed(
@@ -755,6 +790,32 @@ final class VideoExporter: @unchecked Sendable {
             throw VideoExportError.processingFailed(writer.error?.localizedDescription ?? "Finalizing failed.")
         }
         Task { @MainActor in onProgress(1.0) }
+    }
+
+    /// Reader audio is PCM: each sample has a fixed duration, so retaining
+    /// only complete samples at/after the video origin preserves sync.
+    static func trimAudio(_ sample: CMSampleBuffer, startingAt origin: CMTime) throws -> CMSampleBuffer? {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+        guard pts.isNumeric, origin.isNumeric else {
+            throw VideoExportError.processingFailed("Invalid audio timestamp.")
+        }
+        guard CMTimeCompare(pts, origin) < 0 else { return sample }
+        guard let format = CMSampleBufferGetFormatDescription(sample),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mSampleRate.isFinite, asbd.mSampleRate > 0 else {
+            throw VideoExportError.processingFailed("Invalid PCM sample rate.")
+        }
+        let count = CMSampleBufferGetNumSamples(sample)
+        let skipped = ceil(CMTimeSubtract(origin, pts).seconds * asbd.mSampleRate)
+        guard skipped < Double(count) else { return nil }
+        let first = max(0, Int(skipped))
+        var trimmed: CMSampleBuffer?
+        guard CMSampleBufferCopySampleBufferForRange(allocator: kCFAllocatorDefault,
+            sampleBuffer: sample, sampleRange: CFRange(location: first, length: count - first),
+            sampleBufferOut: &trimmed) == noErr, let trimmed else {
+            throw VideoExportError.processingFailed("Couldn't trim leading audio samples.")
+        }
+        return trimmed
     }
 
     /// Returns a copy of `sample` with its presentation (and decode)

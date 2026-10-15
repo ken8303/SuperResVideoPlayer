@@ -44,6 +44,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         var superResolutionEnabled = true
         var upscaleFactor: Double = 1.5
         var frameInterpolationMultiplier = 1
+        var isPlaying = false
         var imageEnhancementEnabled = false
         var enhancementUsesNeural = false
         var enhancementStrength: Double = 0.5
@@ -68,6 +69,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             superResolutionEnabled: viewModel.superResolutionEnabled,
             upscaleFactor: viewModel.upscaleFactor,
             frameInterpolationMultiplier: viewModel.frameInterpolationMultiplier,
+            isPlaying: viewModel.isPlaying,
             imageEnhancementEnabled: viewModel.imageEnhancementEnabled,
             // .max is export-only (Core ML, ~100ms+/frame); playback
             // previews it with the MetalFX neural path.
@@ -77,6 +79,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             hdrOutputActive: viewModel.hdrOutputActive,
             sourcePixelFormat: viewModel.mpv.activeMetalFormat
         )
+        viewModel.mpv.setInterpolationEnabled(viewModel.frameInterpolationMultiplier > 1)
         settingsLock.lock()
         _settings = snapshot
         settingsLock.unlock()
@@ -115,13 +118,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var metalFXInterpolationUsable = true
 
     /// The last two *real* decoded frames, kept alive together with their
-    /// CVPixelBuffers (needed by Vision) and their playback timestamps
-    /// (needed to compute how far playback has progressed between them).
+    /// CVPixelBuffers (needed by Vision), scheduled host times and arrival
+    /// times (needed to interpolate one frame behind the decoder).
     private struct FrameSample {
         let pixelBuffer: CVPixelBuffer
         let texture: MTLTexture
         let cvTexture: CVMetalTexture
         let itemTimeSeconds: Double
+        let arrivalHostTime: Double
     }
     private var previousSample: FrameSample?
     private var currentSample: FrameSample?
@@ -295,8 +299,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         let settings = self.settings
         guard let source = settings.frameSource else { return }
 
-        // mpv can latch down to 8-bit if its build rejects the 16-bit
-        // format; rebuild dependent textures when that happens.
+        // MetalFX colour-processing mode is baked into its descriptors.
         if settings.hdrOutputActive != scalerConfiguredForHDR {
             processedFrame = nil
             cachedInterpolation = nil
@@ -314,6 +317,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
 
+        // Rebuild textures if mpv falls back from 16-bit to 8-bit output.
         let sourceFormat = settings.sourcePixelFormat
         if sourceFormat != pipelinePixelFormat {
             processedFrame = nil
@@ -359,7 +363,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         guard let frameTexture = resolveDisplayTexture(
             source: source,
-            multiplier: max(1, settings.frameInterpolationMultiplier),
+            multiplier: settings.isPlaying ? max(1, settings.frameInterpolationMultiplier) : 1,
             commandBuffer: commandBuffer
         ) else {
             // No frame to show (startup, or a new file just loaded):
@@ -379,7 +383,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                                           enhancement: settings.imageEnhancementEnabled,
                                           neural: settings.enhancementUsesNeural,
                                           strength: settings.enhancementStrength)
-        let canCache = settings.frameInterpolationMultiplier == 1
+        let canCache = !settings.isPlaying || settings.frameInterpolationMultiplier == 1
         let cached = canCache && processedFrame?.key == processingKey ? processedFrame?.texture : nil
         var textureToDisplay: MTLTexture = cached ?? frameTexture
 
@@ -460,6 +464,9 @@ final class Renderer: NSObject, MTKViewDelegate {
             opticalFlow.reset()
             lastMediaGeneration = frame.generation
         }
+        // Evict unused cache entries; current/history wrappers and command
+        // buffers retain everything still required by Vision or the GPU.
+        CVMetalTextureCacheFlush(textureCache, 0)
         let texture = wrapped.texture
         cachedInterpolation = nil
         lastFrameSerial = frame.serial
@@ -470,7 +477,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             print("SuperResVideoPlayer: first video frame received (\(texture.width)x\(texture.height)) [renderer #\(instanceID)]")
         }
 
-        let newSample = FrameSample(pixelBuffer: frame.pixelBuffer, texture: texture, cvTexture: wrapped.backing, itemTimeSeconds: frame.timeSeconds)
+        let newSample = FrameSample(pixelBuffer: frame.pixelBuffer, texture: texture, cvTexture: wrapped.backing, itemTimeSeconds: frame.timeSeconds, arrivalHostTime: frame.arrivalHostTime)
 
         // Ignore duplicate/backwards timestamps (can happen right after a seek).
         if let current = currentSample,
@@ -500,8 +507,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     /// Decides which texture to actually display this frame: a real decoded
-    /// frame, or a synthesized in-between frame, based on how far playback
-    /// has progressed between `previousSample` and `currentSample` and the
+    /// frame, or a synthesized in-between frame, based on host time elapsed
+    /// since the current sample arrived and the
     /// user's chosen interpolation multiplier.
     private func resolveDisplayTexture(source: MPVPlayer, multiplier: Int, commandBuffer: MTLCommandBuffer) -> MTLTexture? {
         lastResolvedKind = .real
@@ -510,10 +517,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             return current.texture
         }
 
-        let itemTimeNow = source.playbackTime
         let span = current.itemTimeSeconds - previous.itemTimeSeconds
-        let rawT = ((itemTimeNow - previous.itemTimeSeconds) / span).clamped(to: 0...1)
-        let stepIndex = Int((rawT * Double(multiplier)).rounded())
+        let phase = VideoMath.interpolationPhase(now: CACurrentMediaTime(),
+            arrival: current.arrivalHostTime, interval: span, multiplier: multiplier)
+        let stepIndex = Int((phase * Double(multiplier)).rounded())
 
         if stepIndex <= 0 { return previous.texture }
         if stepIndex >= multiplier { return current.texture }
@@ -524,9 +531,9 @@ final class Renderer: NSObject, MTKViewDelegate {
               approximatelyEqual(flow.previousTime, previous.itemTimeSeconds),
               approximatelyEqual(flow.currentTime, current.itemTimeSeconds) else {
             // No motion field for this exact pair yet (Vision is still
-            // catching up asynchronously) — show the nearer real frame
-            // rather than stalling or showing a wrong-pair blend.
-            return t < 0.5 ? previous.texture : current.texture
+            // catching up asynchronously) — hold the previous frame to
+            // preserve the same one-frame delay as the audio compensation.
+            return previous.texture
         }
 
         commandBuffer.addCompletedHandler { _ in
@@ -579,7 +586,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         // Warp setup failed (e.g. texture allocation) — show the nearer
         // real frame rather than dropping the draw entirely.
-        return t < 0.5 ? previous.texture : current.texture
+        return previous.texture
     }
 
     // MARK: Custom warp/blend (3x fallback + non-MetalFX fallback)

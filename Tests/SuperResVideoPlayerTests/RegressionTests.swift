@@ -5,6 +5,116 @@ import Metal
 @testable import SuperResVideoPlayer
 
 final class RegressionTests: XCTestCase {
+    @MainActor
+    func testMPVFrameClockAndTextSubtitlesWhenRequested() async throws {
+        guard let path = ProcessInfo.processInfo.environment["SRV_TEST_PLAYBACK_FILE"] else {
+            throw XCTSkip("Opt-in generated playback fixture")
+        }
+        let player = MPVPlayer()
+        defer { player.shutdown() }
+        var sawText = false
+        var sawTextTrack = false
+        player.onTracksChanged = { tracks in
+            sawTextTrack = sawTextTrack || tracks.contains { $0.isTextSubtitle }
+        }
+        player.onSubtitleTextChanged = { text in
+            sawText = sawText || text.contains("Overlay test")
+        }
+        player.setInterpolationEnabled(true)
+        player.load(url: URL(fileURLWithPath: path))
+        var frames: [MPVPlayer.Frame] = []
+        for _ in 0..<160 {
+            try await Task.sleep(nanoseconds: 15_000_000)
+            if let frame = player.latestFrame, frame.serial != frames.last?.serial { frames.append(frame) }
+        }
+        XCTAssertGreaterThan(frames.count, 10)
+        XCTAssertTrue(sawTextTrack)
+        XCTAssertTrue(sawText)
+        for frame in frames {
+            XCTAssertTrue(frame.timeSeconds.isFinite)
+            XCTAssertLessThan(abs(frame.timeSeconds - frame.arrivalHostTime), 0.5)
+        }
+        player.setInterpolationEnabled(false)
+        player.seek(to: 0)
+        player.setPaused(true)
+    }
+
+    func testFFmpegProgressBuffersSplitLines() {
+        var parser = FFmpegProgressParser(duration: 10)
+        XCTAssertEqual(parser.append(Data("out_time_".utf8)), [])
+        XCTAssertEqual(parser.append(Data("us=500".utf8)), [])
+        XCTAssertEqual(parser.append(Data("0000\nout_time_us=10000000\n".utf8)), [0.5, 1])
+    }
+
+    func testFFmpegRetainsFinalErrorAfterLargeOutput() async throws {
+        let directory = try temporaryDirectory()
+        let source = directory.appendingPathComponent("input.mkv")
+        try Data("source".utf8).write(to: source)
+        let ffmpeg = try executable(in: directory, name: "ffmpeg", body: """
+        i=0
+        while [ "$i" -lt 12000 ]; do
+            echo progress=continue
+            echo diagnostic >&2
+            i=$((i + 1))
+        done
+        printf 'FINAL_ERROR_WITHOUT_NEWLINE' >&2
+        exit 7
+        """)
+        let importer = MediaImporter(executableResolver: { $0 == "ffmpeg" ? ffmpeg : nil })
+        do {
+            _ = try await importer.extractAudio(from: source) { _ in }
+            XCTFail("Expected conversion failure")
+        } catch MediaImportError.extractionFailed(let code, let log) {
+            XCTAssertEqual(code, 7)
+            XCTAssertTrue(log.hasSuffix("FINAL_ERROR_WITHOUT_NEWLINE"))
+            XCTAssertLessThanOrEqual(log.utf8.count, 65_536)
+        }
+    }
+
+    func testAudioTrimsSamplesBeforeVideoOrigin() throws {
+        var asbd = AudioStreamBasicDescription(mSampleRate: 1000, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2,
+            mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0)
+        var format: CMAudioFormatDescription?
+        XCTAssertEqual(CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil,
+            extensions: nil, formatDescriptionOut: &format), noErr)
+        var block: CMBlockBuffer?
+        XCTAssertEqual(CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
+            blockLength: 200, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+            offsetToData: 0, dataLength: 200, flags: 0, blockBufferOut: &block), noErr)
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 1000),
+            presentationTimeStamp: CMTime(value: 950, timescale: 1000), decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        var size = 2
+        XCTAssertEqual(CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: format, sampleCount: 100, sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &size,
+            sampleBufferOut: &sample), noErr)
+        let input = try XCTUnwrap(sample)
+        let kept = try XCTUnwrap(VideoExporter.trimAudio(input, startingAt: CMTime(value: 1, timescale: 1)))
+        XCTAssertEqual(CMSampleBufferGetNumSamples(kept), 50)
+        XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(kept).seconds, 1, accuracy: 0.00001)
+        XCTAssertNil(try VideoExporter.trimAudio(input, startingAt: CMTime(value: 2, timescale: 1)))
+        XCTAssertEqual(CMSampleBufferGetNumSamples(try XCTUnwrap(VideoExporter.trimAudio(input, startingAt: .zero))), 100)
+    }
+
+    func testConcurrentMPVCommandsAndShutdown() {
+        let player = MPVPlayer()
+        let group = DispatchGroup()
+        for _ in 0..<3 {
+            group.enter()
+            DispatchQueue.global().async {
+                for _ in 0..<100 { player.setVolume(50); player.setPaused(true) }
+                group.leave()
+            }
+        }
+        player.shutdown()
+        XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
+        player.shutdown()
+    }
+
     func testTranslationRejectsLanguageDriftAndBilingualOutput() {
         XCTAssertFalse(TranslationLanguageValidator.accepts("The Sect Master, the Wandering Mountain Immortal Crane.", target: "ja"))
         XCTAssertFalse(TranslationLanguageValidator.accepts("Hurry up.", target: "ja"))
@@ -204,7 +314,14 @@ final class RegressionTests: XCTestCase {
         let writer = try AVAssetWriter(outputURL: source, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: 64, AVVideoHeightKey: 32
+            AVVideoWidthKey: 64, AVVideoHeightKey: 32,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ],
+            AVVideoPixelAspectRatioKey: [AVVideoPixelAspectRatioHorizontalSpacingKey: 4,
+                                        AVVideoPixelAspectRatioVerticalSpacingKey: 3]
         ])
         let rotation = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 32, ty: 0)
         input.transform = rotation
@@ -245,6 +362,13 @@ final class RegressionTests: XCTestCase {
         let result = AVURLAsset(url: destination)
         let track = try XCTUnwrap(result.tracks(withMediaType: .video).first)
         XCTAssertEqual(track.preferredTransform, rotation)
+        let formats = try await track.load(.formatDescriptions)
+        let format = try XCTUnwrap(formats.first)
+        let extensions = try XCTUnwrap(CMFormatDescriptionGetExtensions(format)) as NSDictionary
+        XCTAssertEqual(extensions[kCMFormatDescriptionExtension_ColorPrimaries] as? String, AVVideoColorPrimaries_ITU_R_709_2)
+        let aspect = try XCTUnwrap(extensions[kCMFormatDescriptionExtension_PixelAspectRatio] as? NSDictionary)
+        XCTAssertEqual((aspect[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing] as? NSNumber)?.intValue, 4)
+        XCTAssertEqual((aspect[kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing] as? NSNumber)?.intValue, 3)
         let reader = try AVAssetReader(asset: result)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
         reader.add(output)

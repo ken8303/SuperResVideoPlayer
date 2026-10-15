@@ -379,35 +379,11 @@ final class MediaImporter: @unchecked Sendable {
         process.standardOutput = stdout
         process.standardError = stderr
 
-        let logLock = NSLock()
-        var errorLog = Data()
-        stderr.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            logLock.lock()
-            errorLog.append(data)
-            if errorLog.count > 65_536 { errorLog = Data(errorLog.suffix(65_536)) }
-            logLock.unlock()
-        }
-
-        // `-progress pipe:1` emits key=value lines; out_time_us is the
-        // current output timestamp in microseconds.
-        stdout.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard durationSeconds.isFinite, durationSeconds > 0,
-                  let text = String(data: data, encoding: .utf8) else { return }
-            for line in text.split(separator: "\n") where line.hasPrefix("out_time_us=") {
-                if let us = Double(line.dropFirst("out_time_us=".count)) {
-                    let progress = min(1.0, max(0.0, (us / 1_000_000) / durationSeconds))
-                    DispatchQueue.main.async { onProgress(progress) }
-                }
-            }
-        }
-
-        defer {
-            stdout.fileHandleForReading.readabilityHandler = nil
-            stderr.fileHandleForReading.readabilityHandler = nil
-        }
+        // Dedicated readers drain both pipes concurrently through EOF. Joining
+        // them after process exit includes the final stderr bytes, without
+        // racing FileHandle readability callbacks or filling a pipe buffer.
+        let readers = DispatchGroup()
+        let capturedLog = FFmpegErrorLog()
 
         // Hold the lock across launch and publication. `cancel()` therefore
         // either records cancellation before launch (and we do not start) or
@@ -425,7 +401,32 @@ final class MediaImporter: @unchecked Sendable {
             processLock.unlock()
             throw error
         }
+        // Close our writer copies so EOF follows the child's exit.
+        stdout.fileHandleForWriting.closeFile()
+        stderr.fileHandleForWriting.closeFile()
+        readers.enter()
+        DispatchQueue.global(qos: .utility).async {
+            defer { readers.leave(); stderr.fileHandleForReading.closeFile() }
+            while true {
+                let data = stderr.fileHandleForReading.availableData
+                if data.isEmpty { break }
+                capturedLog.append(data)
+            }
+        }
+        readers.enter()
+        DispatchQueue.global(qos: .utility).async {
+            defer { readers.leave(); stdout.fileHandleForReading.closeFile() }
+            var parser = FFmpegProgressParser(duration: durationSeconds)
+            while true {
+                let data = stdout.fileHandleForReading.availableData
+                if data.isEmpty { break }
+                for progress in parser.append(data) {
+                    DispatchQueue.main.async { onProgress(progress) }
+                }
+            }
+        }
         process.waitUntilExit()
+        readers.wait()
 
         processLock.lock()
         let wasCancelled = cancellationGeneration != operationGeneration
@@ -436,9 +437,7 @@ final class MediaImporter: @unchecked Sendable {
             throw MediaImportError.cancelled
         }
         guard process.terminationStatus == 0 else {
-            logLock.lock()
-            let log = String(data: errorLog, encoding: .utf8) ?? ""
-            logLock.unlock()
+            let log = capturedLog.text
             throw MediaImportError.extractionFailed(exitCode: process.terminationStatus, log: log)
         }
     }
@@ -588,5 +587,41 @@ final class MediaImporter: @unchecked Sendable {
                 total -= file.size
             }
         }
+    }
+}
+
+private final class FFmpegErrorLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    func append(_ chunk: Data) {
+        lock.lock(); defer { lock.unlock() }
+        data.append(chunk)
+        if data.count > 65_536 { data = Data(data.suffix(65_536)) }
+    }
+    var text: String {
+        lock.lock(); defer { lock.unlock() }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+struct FFmpegProgressParser {
+    let duration: Double
+    private var pending = Data()
+    init(duration: Double) { self.duration = duration }
+    mutating func append(_ data: Data) -> [Double] {
+        guard duration.isFinite, duration > 0 else { return [] }
+        pending.append(data)
+        var values: [Double] = []
+        while let end = pending.firstIndex(of: 10) {
+            let line = String(decoding: pending[..<end], as: UTF8.self)
+            pending.removeSubrange(...end)
+            if line.hasPrefix("out_time_us="),
+               let us = Double(line.dropFirst(12)), us.isFinite {
+                values.append(min(1, max(0, us / 1_000_000 / duration)))
+            }
+        }
+        // A malformed helper must not accumulate an unbounded partial line.
+        if pending.count > 4096 { pending.removeAll(keepingCapacity: true) }
+        return values
     }
 }
